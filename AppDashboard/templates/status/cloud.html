@@ -228,7 +228,21 @@
                                          max: 100,
                                          title: "CPU",
                                          label: "",
-                                         levelColorsGradient: false
+                                         levelColorsGradient: false,
+                                         customSectors: [{
+                                           color : "#2AC567",
+                                           lo : 0,
+                                           hi : 50
+                                         },{
+                                           color : "#f1c40f",
+                                           lo : 25,
+                                           hi : 85
+                                         }, {
+                                           color : "#e74c3c",
+                                           lo : 85,
+                                           hi : 100
+                                         }],
+                                         counter: true
                                        });
 
                                        gauges["g2{{ server['key'] }}"] = new JustGage({
@@ -238,7 +252,21 @@
                                          max: 100,
                                          title: "MEM",
                                          label: "",
-                                         levelColorsGradient: false
+                                         levelColorsGradient: false,
+                                         customSectors: [{
+                                           color : "#2AC567",
+                                           lo : 0,
+                                           hi : 50
+                                         },{
+                                           color : "#f1c40f",
+                                           lo : 50,
+                                           hi : 85
+                                         }, {
+                                           color : "#e74c3c",
+                                           lo : 85,
+                                           hi : 100
+                                         }],
+                                         counter: true
                                         });
 
                                         gauges["g3{{ server['key'] }}"] = new JustGage({
@@ -248,7 +276,21 @@
                                           max: 100,
                                           title: "HD",
                                           label: "",
-                                          levelColorsGradient: false
+                                          levelColorsGradient: false,
+                                          customSectors: [{
+                                            color : "#2AC567",
+                                            lo : 0,
+                                            hi : 50
+                                          },{
+                                            color : "#f1c40f",
+                                            lo : 50,
+                                            hi : 85
+                                          }, {
+                                            color : "#e74c3c",
+                                            lo : 85,
+                                            hi : 100
+                                          }],
+                                          counter: true
                                         });
                                      {% endfor %}
 
@@ -318,7 +360,21 @@
                                            max: 100,
                                            title: "CPU",
                                            label: "",
-                                           levelColorsGradient: false
+                                           levelColorsGradient: false,
+                                           customSectors: [{
+                                             color : "#2AC567",
+                                             lo : 0,
+                                             hi : 50
+                                           },{
+                                             color : "#f1c40f",
+                                             lo : 50,
+                                             hi : 85
+                                           }, {
+                                             color : "#e74c3c",
+                                             lo : 85,
+                                             hi : 100
+                                           }],
+                                           counter: true
                                          });
 
                                          gauges["g2" + server['key']] = new JustGage({
@@ -328,7 +384,21 @@
                                            max: 100,
                                            title: "MEM",
                                            label: "",
-                                           levelColorsGradient: false
+                                           levelColorsGradient: false,
+                                           customSectors: [{
+                                             color : "#2AC567",
+                                             lo : 0,
+                                             hi : 50
+                                           },{
+                                             color : "#f1c40f",
+                                             lo : 50,
+                                             hi : 85
+                                           }, {
+                                             color : "#e74c3c",
+                                             lo : 85,
+                                             hi : 100
+                                           }],
+                                           counter: true
                                           });
 
                                           gauges["g3" + server['key']] = new JustGage({
@@ -338,7 +408,21 @@
                                             max: 100,
                                             title: "HD",
                                             label: "",
-                                            levelColorsGradient: false
+                                            levelColorsGradient: false,
+                                            customSectors: [{
+                                              color : "#2AC567",
+                                              lo : 0,
+                                              hi : 50
+                                            },{
+                                              color : "#f1c40f",
+                                              lo : 50,
+                                              hi : 85
+                                            }, {
+                                              color : "#e74c3c",
+                                              lo : 85,
+                                              hi : 100
+                                            }],
+                                            counter: true
                                           });
                                          }
                                        }
