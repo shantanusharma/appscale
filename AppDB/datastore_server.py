@@ -84,6 +84,20 @@ TOMBSTONE = "APPSCALE_SOFT_DELETE"
 # Local datastore location through nginx.
 LOCAL_DATASTORE = "localhost:8888"
 
+def clean_app_id(app_id):
+  """ Google App Engine uses a special prepended string to signal that it
+      is an HRD application. AppScale does not use this string so we remove
+      it.
+  
+  Args:
+    app_id: A str, the application identifier.
+  Returns:
+    An application identifier without the HRD string.
+  """
+  if app_id.startswith("s~"):
+    return app_id[2:]
+  return app_id
+
 def reference_property_to_reference(refprop):
   """ Creates a Reference from a ReferenceProperty. 
 
@@ -93,7 +107,8 @@ def reference_property_to_reference(refprop):
     A entity_pb.Reference object. 
   """
   ref = entity_pb.Reference()
-  ref.set_app(refprop.app())
+  app_id = clean_app_id(refprop.app())
+  ref.set_app(app_id)
   if refprop.has_name_space():
     ref.set_name_space(refprop.name_space())
   for pathelem in refprop.pathelement_list():
@@ -345,7 +360,8 @@ class DatastoreDistributed():
       data = data.key()
 
     if not isinstance(data, tuple):
-      data = (data.app(), data.name_space())
+      app_id = clean_app_id(data.app())
+      data = (app_id, data.name_space())
 
     prefix = "{0}{2}{1}".format(data[0], data[1], 
       self._SEPARATOR).replace('"', '""')
@@ -566,7 +582,7 @@ class DatastoreDistributed():
     """ 
     composite_id = index.id()
     definition = index.definition()
-    app_id = entity.key().app()
+    app_id = clean_app_id(entity.key().app())
     name_space = entity.key().name_space()
     ent_key = self.__encode_index_pb(entity.key().path())
     pre_comp_index_key = "{0}{1}{2}{4}{3}{4}".format(app_id, 
@@ -1044,7 +1060,7 @@ class DatastoreDistributed():
       tokens = entity_key.split(dbconstants.KIND_SEPARATOR)
       return tokens[0] + dbconstants.KIND_SEPARATOR
     elif isinstance(entity_key, entity_pb.Reference):
-      app_id = entity_key.app()
+      app_id = clean_app_id(entity_key.app())
       path = entity_key.path()
       element_list = path.element_list()
       return self.get_root_key(app_id, entity_key.name_space(), element_list)
@@ -1172,7 +1188,7 @@ class DatastoreDistributed():
       app_id = entities[0].app()
     else:
       app_id = entities[0].key().app()
-
+    app_id = clean_app_id(app_id)
     # Remove all duplicate root keys.
     root_keys = list(set(root_keys))
     try:
@@ -1395,7 +1411,7 @@ class DatastoreDistributed():
                        row_keys, 
                        dbconstants.APP_ENTITY_SCHEMA) 
     if len(key_list) != 0:
-      result = self.validated_result(key_list[0].app(), 
+      result = self.validated_result(clean_app_id(key_list[0].app()), 
                   result, current_ongoing_txn=current_txnid)
     result = self.remove_tombstoned_entities(result)
     return (result, row_keys)
@@ -1678,11 +1694,12 @@ class DatastoreDistributed():
       root_key = self.get_root_key_from_entity_key(ancestor)
       try:
         prefix = self.get_table_prefix(query)
-        self.zookeeper.acquire_lock(query.app(), txn_id, root_key)
+        self.zookeeper.acquire_lock(clean_app_id(query.app()), txn_id, root_key)
       except ZKTransactionException, zkte:
         logging.warning("Concurrent transaction exception for app id {0}, " \
           "transaction id {1}, info {2}".format(query.app(), txn_id, str(zkte)))
-        self.zookeeper.notify_failed_transaction(query.app(), txn_id)
+        self.zookeeper.notify_failed_transaction(clean_app_id(query.app()), 
+          txn_id)
         raise zkte
 
     startrow = path
@@ -1736,11 +1753,12 @@ class DatastoreDistributed():
       txn_id = query.transaction().handle()   
       root_key = self.get_root_key_from_entity_key(ancestor)
       try:
-        self.zookeeper.acquire_lock(query.app(), txn_id, root_key)
+        self.zookeeper.acquire_lock(clean_app_id(query.app()), txn_id, root_key)
       except ZKTransactionException, zkte:
         logging.warning("Concurrent transaction exception for app id {0}, " \
           "transaction id {1}, info {2}".format(query.app(), txn_id, str(zkte)))
-        self.zookeeper.notify_failed_transaction(query.app(), txn_id)
+        self.zookeeper.notify_failed_transaction(clean_app_id(query.app()), 
+          txn_id)
         raise zkte
 
     startrow = path
@@ -1833,7 +1851,7 @@ class DatastoreDistributed():
       else: 
         break
 
-      result = self.validated_result(query.app(), result, 
+      result = self.validated_result(clean_app_id(query.app()), result, 
                                      current_ongoing_txn=txn_id)
 
       result = self.remove_tombstoned_entities(result)
@@ -1987,16 +2005,18 @@ class DatastoreDistributed():
           dbconstants.KIND_SEPARATOR + __key__ 
     return startrow, endrow, start_inclusive, end_inclusive
 
-  def namespace_query(self):
-    """ Performs a metadata namespace query.
+  def default_namespace(self):
+    """ Returns the default namespace entry because the groomer does not
+    generate it for each application.
  
     Returns:
-      A list of entity protos holding Namespace kinds.
+      A entity proto of the default metadata.Namespace.
     """
-    #TODO implement where we return all active namespaces.
     default_namespace = Namespace(id=1)
     protobuf = db.model_to_protobuf(default_namespace)
-    return [protobuf.Encode()]
+    last_path = protobuf.key().path().element_list()[-1]
+    last_path.set_id(1)
+    return protobuf.Encode()
 
   def __kind_query(self, query, filter_info, order_info):
     """ Performs kind only queries, kind and ancestor, and ancestor queries
@@ -2023,8 +2043,10 @@ class DatastoreDistributed():
       return self.ancestor_query(query, filter_info, order_info)
     elif not query.has_kind():
       return self.kindless_query(query, filter_info, order_info)
-    elif query.kind() == "__namespace__":
-      return self.namespace_query()
+    elif query.kind().startswith("__") and \
+      query.kind().endswith("__"):
+      # Use the default namespace for metadata queries.
+      query.set_name_space("")
  
     startrow, endrow, start_inclusive, end_inclusive = \
       self.kind_query_range(query, filter_info, order_info)
@@ -2043,6 +2065,7 @@ class DatastoreDistributed():
     limit = self.get_limit(query)
     if startrow > endrow:
       return []
+
     result = self.datastore_batch.range_query(dbconstants.APP_KIND_TABLE, 
                                               dbconstants.APP_KIND_SCHEMA, 
                                               startrow, 
@@ -2052,7 +2075,10 @@ class DatastoreDistributed():
                                               start_inclusive=start_inclusive, 
                                               end_inclusive=end_inclusive)
 
-    return self.__fetch_entities(result, query.app())
+    fetched_entities = self.__fetch_entities(result, clean_app_id(query.app()))
+    if query.kind() == "__namespace__":
+      fetched_entities = [self.default_namespace()] + fetched_entities
+    return fetched_entities
 
   def remove_exists_filters(self, filter_info):
     """ We don't have native support for projection queries, so remove
@@ -2082,6 +2108,11 @@ class DatastoreDistributed():
     Returns:
       List of entities retrieved from the given query.
     """
+    if query.kind().startswith("__") and \
+      query.kind().endswith("__"):
+      # Use the default namespace for metadata queries.
+      query.set_name_space("")
+ 
     filter_info = self.remove_exists_filters(filter_info)
     ancestor = None
     property_names = set(filter_info.keys())
@@ -2146,7 +2177,7 @@ class DatastoreDistributed():
                                query=query,
                                end_compiled_cursor=end_compiled_cursor)
 
-    return self.__fetch_entities(references, query.app())
+    return self.__fetch_entities(references, clean_app_id(query.app()))
  
   def __apply_filters(self, 
                      filter_ops, 
@@ -2598,7 +2629,8 @@ class DatastoreDistributed():
         force_exclusive = True
 
     result_list.sort()
-    result_set = self.__fetch_entities_from_row_list(result_list, query.app())
+    result_set = self.__fetch_entities_from_row_list(result_list, 
+      clean_app_id(query.app()))
     return result_set
 
   def does_composite_index_exist(self, query):
@@ -2628,7 +2660,7 @@ class DatastoreDistributed():
     composite_index = query.composite_index_list()[0]
     index_id = composite_index.id()
     definition = composite_index.definition()
-    app_id = query.app()
+    app_id = clean_app_id(query.app())
     name_space = ''
     if query.has_name_space():
       name_space = query.name_space() 
@@ -2847,7 +2879,7 @@ class DatastoreDistributed():
                                              offset=offset, 
                                              start_inclusive=start_inclusive,
                                              end_inclusive=True)
-    return self.__fetch_entities(index_result, query.app())
+    return self.__fetch_entities(index_result, clean_app_id(query.app()))
 
   def __composite_query(self, query, filter_info, _):  
     """Performs Composite queries which is a combination of 
@@ -2957,7 +2989,8 @@ class DatastoreDistributed():
           ('query is too large. may not have more than {0} filters'
            ' + sort orders ancestor total'.format(self._MAX_QUERY_COMPONENTS)))
 
-    app_id = query.app()
+    app_id = clean_app_id(query.app())
+
     self.validate_app_id(app_id)
     filters, orders = datastore_index.Normalize(query.filter_list(),
                                                 query.order_list(), [])
@@ -3102,6 +3135,9 @@ class MainHandler(tornado.web.RequestHandler):
       os.environ['APPLICATION_ID'] = app_id
     else:
       return
+
+    # If the application identifier has the HRD string prepened, remove it.
+    app_id = clean_app_id(app_id)
 
     if pb_type == "Request":
       self.remote_request(app_id, http_request_data)
