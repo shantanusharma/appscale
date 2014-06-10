@@ -15,7 +15,7 @@ if [ -z "$APPSCALE_PACKAGE_MIRROR" ]; then
     export APPSCALE_PACKAGE_MIRROR=http://s3.amazonaws.com/appscale-build
 fi
 
-export APPSCALE_VERSION=1.14.0
+export APPSCALE_VERSION=2.0.0
 
 pip_wrapper () 
 {
@@ -257,6 +257,7 @@ portinstallmonit()
     cp ${APPSCALE_HOME}/monitrc /etc/monit/monitrc
     chmod 0700 /etc/monit/monitrc
     service monit restart
+    update-rc.d monit disable
 }
 
 installcassandra()
@@ -343,6 +344,11 @@ installzookeeper()
   apt-get install -y zookeeper-server 
 
   pip_wrapper kazoo
+}
+
+installpycrypto()
+{
+  pip_wrapper pycrypto
 }
 
 postinstallzookeeper()
