@@ -1,6 +1,6 @@
 require 'rubygems'
 require 'rake'
-require 'rake/rdoctask'
+require 'rdoc/task'
 require 'rake/testtask'
 
 
@@ -28,21 +28,21 @@ namespace :appcontroller do
 
 end
 
-
-namespace :python do
-
-  task :test do
-    sh "bash ts_python.sh"
-  end
-
-end
-
 namespace :appmanager do
   
   task :test do
    sh "nosetests AppManager/test/unit"
   end
 
+end
+
+namespace :apps do
+
+  task :test do
+    sh "nosetests Apps/sensor/tests " +
+      "Apps/sensor/common/tests"
+  end
+  
 end
 
 namespace :infrastructuremanager do
@@ -69,6 +69,31 @@ namespace :apptaskqueue do
 
 end
 
+namespace :go do
+
+  task :test do
+    goroot = '/root/appscale/AppServer/goroot'
+    sh "PATH=#{goroot}/bin:${PATH}; cd #{goroot}/src; ./run.bash --no-rebuild"
+  end
+
+end
+
+namespace :hermes do
+
+  task :test do
+    sh "nosetests Hermes/test/unit"
+  end
+
+end
+
+namespace :searchservice do
+
+  task :test do
+    sh "nosetests SearchService/test/unit"
+  end
+
+end
+
 namespace :appserver do
 
   task :test do
@@ -90,7 +115,7 @@ end
 namespace :appdashboard do
 
   task :test do
-    sh "python AppDashboard/test/unit/test_suite.py"
+    sh "nosetests AppDashboard/test/unit"
   end
 
   task :coverage do |test|
@@ -120,4 +145,22 @@ namespace :xmppreceiver do
 
 end
 
-task :default => ['appcontroller:test', 'infrastructuremanager:test', 'appmanager:test', 'appdb:test', 'apptaskqueue:test', 'lib:test', 'appserver:test', 'xmppreceiver:test', 'appdashboard:test']
+python_tests = [
+  'appdashboard:test',
+  'appdb:test',
+  'appmanager:test',
+  'appserver:test',
+  'apptaskqueue:test',
+  'hermes:test',
+  'infrastructuremanager:test',
+  'lib:test',
+  'searchservice:test',
+  'xmppreceiver:test',
+  'apps:test'
+]
+ruby_tests = ['appcontroller:test']
+go_tests = ['go:test']
+
+task :brief => python_tests + ruby_tests
+
+task :default => python_tests + ruby_tests + go_tests

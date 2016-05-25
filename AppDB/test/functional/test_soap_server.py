@@ -2,28 +2,20 @@
 # Test for soap calls
 # Test each exit point on the soap calls
 
-import string, cgi
 import sys
 import os
 import helper_functions
 PYTHON_PATH = os.environ.get("PYTHONPATH")
 
 import SOAPpy
-import time
-import socket
-import datetime
 
 APPSCALE_HOME = os.environ.get("APPSCALE_HOME")
 if APPSCALE_HOME:
   pass
 else:
-  APPSCALE_HOME = "/etc/appscale"
+  APPSCALE_HOME = "/root/appscale"
   print "APPSCALE_HOME env var not set. Using default " + APPSCALE_HOME
 
-import cgitb; #cgitb.enable()
-import getopt
-import pickle
-from M2Crypto import SSL
 APP_TABLE = "APPS__"
 USER_TABLE = "USERS__"
 DEFAULT_USER_LOCATION = ".flatfile_users"
@@ -36,9 +28,8 @@ DEFAULT_ENCRYPTION = 1
 VALID_DATASTORES = []
 CERT_LOCATION = APPSCALE_HOME + "/.appscale/certs/mycert.pem"
 KEY_LOCATION = APPSCALE_HOME + "/.appscale/certs/mykey.pem"
-SECRET_LOCATION = APPSCALE_HOME + "/secret.key"
+SECRET_LOCATION = APPSCALE_HOME + "/.appscale/secret.key"
 user_location = DEFAULT_USER_LOCATION
-app_location = DEFAULT_APP_LOCATION
 datastore_type = DEFAULT_DATASTORE
 encryptOn = DEFAULT_ENCRYPTION
 bindport = DEFAULT_SSL_PORT
@@ -53,7 +44,6 @@ app_schema = []
 BAD_SECRET = "Error: bad secret"
 #Navraj Chohan
 app_location = "localhost"
-bindport = DEFAULT_SSL_PORT
 encrypt = True
 appname = ""
 username = ""
@@ -177,10 +167,6 @@ ret = server.is_user_enabled("xxx", "xxx")
 if ret != BAD_SECRET:
   err(helper_functions.lineno(), ret)
 
-ret = server.add_class("xxx", "xxx", "xxx", "xxx")
-if ret != BAD_SECRET:
-  err(helper_functions.lineno(), ret)
-
 ret = server.add_instance("xxx","xxx", "xxx", "xxx")
 if ret != BAD_SECRET:
   err(helper_functions.lineno(), ret)
@@ -221,10 +207,6 @@ ret = server.get_version("xxx", "xxx")
 if ret != BAD_SECRET:
   err(helper_functions.lineno(), ret)
 
-ret = server.get_ip("xxx", "xxx")
-if ret != BAD_SECRET:
-  err(helper_functions.lineno(), ret)
-
 ret = server.commit_new_user("xxx", "xxx", "user", "xxx")
 if ret != BAD_SECRET:
   err(helper_functions.lineno(), ret)
@@ -238,10 +220,6 @@ if ret != BAD_SECRET:
   err(helper_functions.lineno(), ret)
 
 ret = server.commit_new_token("xxx", "xxx", "xxx", "xxx")
-if ret != BAD_SECRET:
-  err(helper_functions.lineno(), ret)
-
-ret = server.commit_ip("xxx", "xxx", "xxx")
 if ret != BAD_SECRET:
   err(helper_functions.lineno(), ret)
 
@@ -316,10 +294,6 @@ if ret != "false":
   print user[0]
   err(helper_functions.lineno(), ret)
 
-ret = server.add_class(app[0], "xxx", "xxx", super_secret)
-if ret != "Error: Unable to get entity for app":
-  err(helper_functions.lineno(), ret)
-
 ret = server.add_instance(app[0], "xxx", "xxx", super_secret)
 if ret != "false":
   err(helper_functions.lineno(), ret)
@@ -356,10 +330,6 @@ if ret != "false":
 
 ret = server.get_version(app[0], super_secret)
 if ret != "false":
-  err(helper_functions.lineno(), ret)
-
-ret = server.get_ip("xxx", super_secret)
-if "false" not in ret:
   err(helper_functions.lineno(), ret)
 
 ret = server.delete_instance(app[0], "xxx", "xxx", super_secret)
@@ -419,7 +389,7 @@ if ret != "true":
 # Commit user twice
 ###################
 ret = server.commit_new_user(user[0], user[1], "user", super_secret)
-if ret != "Error: user already exist":
+if ret != "Error: user already exists":
   err(helper_functions.lineno(), ret)
 
 ret = server.does_user_exist(user[0], super_secret)
@@ -517,19 +487,6 @@ if ret != "true":
 ##################
 ret = server.is_user_enabled(user[0], super_secret)
 if ret != "true":
-  err(helper_functions.lineno(), ret)
-#################
-# Commit a new ip
-#################
-ip = helper_functions.random_string(10)
-ret = server.commit_ip(ip, user[0], super_secret)
-if ret != "true":
-  err(helper_functions.lineno(), ret)
-###################
-# Get Email from IP
-###################
-ret = server.get_ip(ip, super_secret)
-if ret != user[0]:
   err(helper_functions.lineno(), ret)
 #########################
 # Commit bad name for app
@@ -632,30 +589,13 @@ if ret != "true":
 # Get app data 
 ###################
 ret = server.get_app_data(app[0], super_secret)
-if user[0] not in ret or app[0] not in ret \
-or host1 not in ret or port1 not in ret \
-or host2 not in ret or port2 not in ret:
-  err(helper_functions.lineno(), ret)
-####################
-# Add class to app
-####################
-appclass1 = helper_functions.random_string(10)
-ret = server.add_class(app[0], appclass1, "xxx", super_secret)
-if ret != "true":
-  err(helper_functions.lineno(), ret)
-####################
-# Add class to app
-####################
-appclass2 = helper_functions.random_string(10)
-ret = server.add_class(app[0], appclass2, "xxx", super_secret)
-if ret != "true":
+if user[0] not in ret or app[0] not in ret:
   err(helper_functions.lineno(), ret)
 ###################
 # Get app data 
 ###################
 ret = server.get_app_data(app[0], super_secret)
-if user[0] not in ret or app[0] not in ret \
-or appclass1 not in ret or appclass2 not in ret:
+if user[0] not in ret or app[0] not in ret:
   err(helper_functions.lineno(), ret)
 ####################
 # Remove an instance
@@ -763,14 +703,14 @@ if "enabled:false" not in ret:
   err(helper_functions.lineno(), ret)
 ret = server.get_app_data(app2[0], super_secret)
 if "enabled:false" not in ret:
-  err(helper_function.lineno(), ret)
+  err(helper_functions.lineno(), ret)
 ########################
 # Commit a new tar ball
 #######################
 tar2 = helper_functions.random_string(10000)
 ret = server.commit_tar(app[0], tar2, super_secret)
 if ret != "true":
-  err(helper_function.lineno(), ret)
+  err(helper_functions.lineno(), ret)
 ##########################
 # Get app data and version
 ##########################

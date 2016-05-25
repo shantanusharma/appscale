@@ -16,7 +16,7 @@ require 'zookeeper'
 # A class of exceptions that we throw whenever we perform a ZooKeeper
 # operation that does not return successfully (but does not normally
 # throw an exception).
-class FailedZooKeeperOperationException < Exception
+class FailedZooKeeperOperationException < StandardError
 end
 
 
@@ -76,17 +76,6 @@ class ZKInterface
   SCALING_DECISION_PATH = "#{APPCONTROLLER_PATH}/scale"
 
 
-  # The location in ZooKeeper that the Babel Master and Slaves will read and
-  # write data to that should be globally accessible or fault-tolerant.
-  BABEL_PATH = "/babel"
-
-
-  # The location in ZooKeeper that the Babel Master's threads read and write
-  # to, to determine the maximum number of machines that should be used to
-  # run Babel tasks.
-  BABEL_MAX_MACHINES_PATH = "#{BABEL_PATH}/max_slaves_machines"
-
-
   # The name of the file that nodes use to store the list of Google App Engine
   # instances that the given node runs.
   APP_INSTANCE = "app_instance"
@@ -125,21 +114,28 @@ class ZKInterface
     end
 
     @@lock.synchronize {
+      if defined?(@@zk)
+        Djinn.log_debug("Closing old connection to zookeeper.")
+        @@zk.close!
+      end
+      Djinn.log_debug("Opening connection to zookeeper at #{ip}.")
       @@zk = Zookeeper.new("#{ip}:#{SERVER_PORT}", timeout=TIMEOUT)
     }
   end
 
-
-  # Initializes a new ZooKeeper connection to the "closest" node in the
-  # system. "Closeness" is defined as either "this node" (if it runs
-  # ZooKeeper), or an arbitrary node that runs ZooKeeper. Callers should use
-  # this method when they don't want to determine on their own which
-  # ZooKeeper box to connect to.
-  def self.init(my_node, all_nodes)
-    self.init_to_ip(my_node.private_ip, self.get_zk_location(my_node,
-      all_nodes))
+  # This method check if we are already connected to a zookeeper server.
+  #
+  # Returns:
+  #   A boolean to indicate if we are already connected to a zookeeper
+  #   server.
+  def self.is_connected?()
+    ret = false
+    if defined?(@@zk)
+      ret = @@zk.connected?
+    end
+    Djinn.log_debug("Connection status with zookeeper server: #{ret}.")
+    return ret
   end
-
 
   # Creates a new connection to use with ZooKeeper. Useful for scenarios
   # where the ZooKeeper library has terminated our connection but we still
@@ -306,20 +302,19 @@ class ZKInterface
         if @@client_ip == owner
           got_lock = false
         else 
-          Djinn.log_warn("Tried to get the lock, but it's currently owned " +
-            "by #{owner}. Will try again later.")
-          raise Exception
+          raise "Tried to get the lock, but it's currently owned by #{owner}."
         end
       end
-    rescue Exception => e
-      Djinn.log_warn("Saw an exception of class #{e.class}")
-      Kernel.sleep(5)
+    rescue => e
+      sleep_time = 5
+      Djinn.log_warn("Saw #{e.inspect}. Retrying in #{sleep_time} seconds.")
+      Kernel.sleep(sleep_time)
       retry
     end
 
     begin
       yield  # invoke the user's block, and catch any uncaught exceptions
-    rescue Exception => except
+    rescue => except
       Djinn.log_error("Ran caller's block but saw an Exception of class " +
         "#{except.class}")
       raise except
@@ -514,29 +509,6 @@ class ZKInterface
   end
 
 
-  # Writes the integer corresponding to the maximum number of nodes that
-  # should be acquired (whether they be already running open nodes or newly
-  # spawned virtual machines) to become Babel slaves (workers).
-  def self.set_max_machines_for_babel_slaves(maximum)
-    if !self.exists?(BABEL_PATH)
-      self.set(BABEL_PATH, DUMMY_DATA, NOT_EPHEMERAL)
-    end
-
-    self.set(BABEL_MAX_MACHINES_PATH, JSON.dump(maximum), NOT_EPHEMERAL)
-  end
-
-  
-  # Returns the maximum number of nodes that should be used to run Babel
-  # jobs (not including the Babel Master).
-  def self.get_max_machines_for_babel_slaves()
-    if !self.exists?(BABEL_MAX_MACHINES_PATH)
-      return 0
-    end
-
-    return JSON.load(self.get(BABEL_MAX_MACHINES_PATH))
-  end
-  
-
   # Returns an Array of Hashes that correspond to the App Engine applications
   # hosted on the given ip address. Each hash contains the application's name,
   # the IP address (which should be the same as the given IP), and the nginx
@@ -710,9 +682,9 @@ class ZKInterface
       self.reinitialize()
       Kernel.sleep(1)
       retry
-    rescue Exception => e
-      Djinn.log_warn("Saw a transient ZooKeeper error of class #{e.class}" +
-        " - trying again.")
+    rescue => e
+      backtrace = e.backtrace.join("\n")
+      Djinn.log_warn("Saw a transient ZooKeeper error: #{e}\n#{backtrace}")
       Kernel.sleep(1)
       retry
     end
@@ -816,28 +788,5 @@ class ZKInterface
         " path #{key}, saw info #{info.inspect}")
     end
   end
-
-
-  def self.get_zk_location(my_node, all_nodes)
-    if my_node.is_zookeeper?
-      return my_node.private_ip
-    end
-
-    zk_node = nil
-    all_nodes.each { |node|
-      if node.is_zookeeper?
-        zk_node = node
-        break
-      end
-    }
-
-    if zk_node.nil?
-      HelperFunctions.log_and_crash("No ZooKeeper nodes were found. All " +
-        "nodes are #{nodes}, while my node is #{my_node}.")
-    end
-
-    return zk_node.private_ip
-  end
-
 
 end

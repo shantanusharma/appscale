@@ -3,13 +3,7 @@
 
 import imp
 import os
-import socket
-import string
 import sys
-import threading
-import types
-
-import dbconstants
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../lib/"))
 import constants
@@ -27,16 +21,18 @@ class DatastoreFactory:
     Args: 
       d_type: The name of the datastore (ex: cassandra)
     """
+    database_env_dir = '{}/{}_env'.format(DATASTORE_DIR, d_type)
+    sys.path.append(database_env_dir)
 
-    datastore = None
-    mod_path = DATASTORE_DIR + "/" + d_type + "/" + d_type + "_interface.py"
+    module_name = '{}_interface'.format(d_type)
+    handle, path, description = imp.find_module(module_name)
 
-    if os.path.exists(mod_path):
-      sys.path.append(DATASTORE_DIR + "/" + d_type)
-      d_mod = imp.load_source(d_type+"_interface.py", mod_path)
-      datastore = d_mod.DatastoreProxy()
-    else:
-      raise Exception("Fail to use datastore: %s" % d_type)
+    try:
+      db_module = imp.load_module(module_name, handle, path, description)
+      datastore = db_module.DatastoreProxy()
+    finally:
+      if handle:
+        handle.close()
 
     return datastore
 

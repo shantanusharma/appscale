@@ -34,18 +34,23 @@ public class DevAppServerMain
     public static final String  GENERATED_WAR_DIR_ARG                 = "generated_war_dir";
     private static final String DEFAULT_RDBMS_PROPERTIES_FILE         = ".local.rdbms.properties";
     private static final String RDBMS_PROPERTIES_FILE_SYSTEM_PROPERTY = "rdbms.properties.file";
+    
+    private static final String SYSTEM_PROPERTY_STATIC_MODULE_PORT_NUM_PREFIX = "com.google.appengine.devappserver_module.";
+    
     private static String       originalTimeZone;
     private final Action        ACTION                                = new StartAction();
 
-    private String              server                                = SdkInfo.getDefaultServer();
+    private String              versionCheckServer                    = SdkInfo.getDefaultServer();
 
     private String              address                               = "127.0.0.1";
     private int                 port                                  = 8080;
     private boolean             disableUpdateCheck;
     private boolean             disableRestrictedCheck                = true;
+    private boolean noJavaAgent = false;
     private String              externalResourceDir                   = null;
     private List<String>        propertyOptions                       = null;
     private String              generatedDirectory                    = null;
+    private String 				defaultGcsBucketName 				  = null;
 
     // add for AppScale
     private String              db_location;
@@ -54,6 +59,7 @@ public class DevAppServerMain
     private String              appscale_version;
     private String              admin_console_version;
     private static final String PORT_FILE_PREFIX                      = "/etc/appscale/port-";
+    private static final String SECRET_LOCATION                       = "/etc/appscale/secret.key";
 
     private final List<Option>  PARSERS                               = buildOptions(this);
     private static final String PREFIX                                = "When generating a war directory,";
@@ -76,7 +82,7 @@ public class DevAppServerMain
         {
             public void apply()
             {
-                this.main.server = getValue();
+                this.main.versionCheckServer = getValue();
             }
 
             public List<String> getHelpLines()
@@ -139,7 +145,17 @@ public class DevAppServerMain
             {
                 return ImmutableList.of(" --generated_dir=DIR        Set the directory where generated files are created.");
             }
-        }, new DevAppServerOption(main, null, "disable_restricted_check", true)
+        }, new DevAppServerOption(main, null, "default_gcs_bucket", false) {
+            @Override
+            public void apply() {
+                this.main.defaultGcsBucketName = getValue();
+                }
+            @Override
+            public List<String> getHelpLines() {
+                return ImmutableList.of(
+                        " --default_gcs_bucket=NAME  Set the default Google Cloud Storage bucket name.");
+                }
+        },new DevAppServerOption(main, null, "disable_restricted_check", true)
         {
             public void apply()
             {
@@ -174,13 +190,6 @@ public class DevAppServerMain
                 this.main.login_server = getValue();
                 System.setProperty("LOGIN_SERVER", this.main.login_server);
             }
-        }, new DevAppServerOption(main, null, "cookie_secret", false)
-        {
-            public void apply()
-            {
-                this.main.cookie = getValue();
-                System.setProperty("COOKIE_SECRET", this.main.cookie);
-            }
         }, new DevAppServerOption(main, null, "appscale_version", false)
         {
             public void apply()
@@ -188,6 +197,16 @@ public class DevAppServerMain
                 this.main.appscale_version = getValue();
                 System.setProperty("APP_SCALE_VERSION", this.main.appscale_version);
             }
+        }, new DevAppServerOption(main, null, "instance_port", false) {
+            @Override
+        	public void apply() {
+        	   processInstancePorts(getValues());
+        	}
+        }, new DevAppServerOption(main, null, "no_java_agent", true) {
+        	@Override
+        	public void apply() {
+        	    this.main.noJavaAgent = true;
+        	}
         }, new DevAppServerOption(main, null, "admin_console_version", false)
         { // changed from admin_console_server
                     public void apply()
@@ -215,16 +234,39 @@ public class DevAppServerMain
                     }
                 } });
     }
+    
+    private static void processInstancePorts(List<String> optionValues) {
+      for (String optionValue : optionValues) {
+        String[] keyAndValue = optionValue.split("=", 2);
+        if (keyAndValue.length != 2) {
+            reportBadInstancePortValue(optionValue);
+            }
+
+        try {
+            Integer.parseInt(keyAndValue[1]);
+            } catch (NumberFormatException nfe) {
+                reportBadInstancePortValue(optionValue);
+                }
+
+        System.setProperty(
+                SYSTEM_PROPERTY_STATIC_MODULE_PORT_NUM_PREFIX + keyAndValue[0].trim() + ".port",
+                keyAndValue[1].trim());
+        }
+    }
+
+    private static void reportBadInstancePortValue(String optionValue) {
+        throw new IllegalArgumentException("Invalid instance_port value " + optionValue);
+    }
 
     private static String getNginxPort()
     {
         String appName = System.getProperty("APP_NAME");
         String portString = null;
-        BufferedReader br = null;
+        BufferedReader bufferReader = null;
         try
         {
-            br = new BufferedReader(new FileReader(PORT_FILE_PREFIX + appName + ".txt"));
-            portString = br.readLine();
+            bufferReader = new BufferedReader(new FileReader(PORT_FILE_PREFIX + appName + ".txt"));
+            portString = bufferReader.readLine();
         }
         catch(IOException e)
         {
@@ -235,7 +277,7 @@ public class DevAppServerMain
         {
             try
             {
-                if (br != null)br.close();
+                if (bufferReader != null) bufferReader.close();
             } 
             catch (IOException ex)
             {
@@ -380,20 +422,22 @@ public class DevAppServerMain
                     externalResourceDir = appDirs.getExternalResourceDir();
                 }
 
-                UpdateCheck updateCheck = new UpdateCheck(DevAppServerMain.this.server, appDir, true);
+                UpdateCheck updateCheck = new UpdateCheck(DevAppServerMain.this.versionCheckServer, appDir, true);
                 if ((updateCheck.allowedToCheckForUpdates()) && (!DevAppServerMain.this.disableUpdateCheck))
                 {
                     updateCheck.maybePrintNagScreen(System.err);
                 }
                 updateCheck.checkJavaVersion(System.err);
 
-                DevAppServer server = new DevAppServerFactory().createDevAppServer(appDir, externalResourceDir, DevAppServerMain.this.address, DevAppServerMain.this.port);
+                DevAppServer server = new DevAppServerFactory().createDevAppServer(appDir, externalResourceDir, DevAppServerMain.this.address, DevAppServerMain.this.port, noJavaAgent);
 
                 Map properties = System.getProperties();
 
                 Map stringProperties = properties;
                 setTimeZone(stringProperties);
                 setGeneratedDirectory(stringProperties);
+                setDefaultGcsBucketName(stringProperties);
+                setSecret();
                 if (DevAppServerMain.this.disableRestrictedCheck)
                 {
                     stringProperties.put("appengine.disableRestrictedCheck", "");
@@ -401,7 +445,6 @@ public class DevAppServerMain
                 setRdbmsPropertiesFile(stringProperties, appDir, externalResourceDir);
                 stringProperties.putAll(DevAppServerMain.parsePropertiesList(DevAppServerMain.this.propertyOptions));
                 server.setServiceProperties(stringProperties);
-
                 server.start();
                 try
                 {
@@ -420,6 +463,34 @@ public class DevAppServerMain
             {
                 ex.printStackTrace();
                 System.exit(1);
+            }
+        }
+
+        // Set the AppScale secret.
+        private void setSecret()
+        {
+            BufferedReader bufferReader = null;
+            try
+            {
+                bufferReader = new BufferedReader(new FileReader(SECRET_LOCATION));
+                String value = bufferReader.readLine();
+                System.setProperty("COOKIE_SECRET", value);
+            }
+            catch(IOException e)
+            {
+               System.out.println("IOException getting port from secret key file.");
+               e.printStackTrace(); 
+            }        
+            finally
+            {
+               try
+               {
+                   if (bufferReader != null) bufferReader.close();
+               } 
+               catch (IOException ex)
+               {
+                   ex.printStackTrace();
+               }
             }
         }
 
@@ -458,6 +529,12 @@ public class DevAppServerMain
                 }
                 stringProperties.put("appengine.generated.dir", DevAppServerMain.this.generatedDirectory);
             }
+        }
+        
+        private void setDefaultGcsBucketName(Map<String, String> stringProperties) {
+          if (defaultGcsBucketName != null) {
+              stringProperties.put("appengine.default.gcs.bucket.name", defaultGcsBucketName);
+          }
         }
 
         private void setRdbmsPropertiesFile( Map<String, String> stringProperties, File appDir, File externalResourceDir )

@@ -8,10 +8,6 @@
 # methods that abstract away its configuration and deployment.
 module AppDashboard
 
-
-  SERVER_PORTS = [8000, 8001, 8002]
-
-
   # The port which nginx will use to send requests to haproxy
   PROXY_PORT = 8060
 
@@ -34,10 +30,6 @@ module AppDashboard
   APP_LANGUAGE = "python27"
 
 
-  # The path on the local filesystem where static files can be served from.
-  PUBLIC_DIRECTORY = "#{APPSCALE_HOME}/AppDashboard/static"
-
-
   # Starts the AppDashboard on this machine. Does not configure or start nginx
   # or haproxy, which are needed to load balance traffic to the AppDashboard
   # instances we start here.
@@ -54,8 +46,8 @@ module AppDashboard
   # Returns:
   #   true if the AppDashboard was started successfully, and false otherwise.
   def self.start(login_ip, uaserver_ip, public_ip, private_ip, secret)
-    # TODO: tell the tools to disallow uploading apps called 'apichecker'
-    # or APP_NAME, and have start_appengine to do the same.   
+    # TODO: tell the tools to disallow uploading apps called 
+    # APP_NAME, and have start_appengine to do the same.   
     app_manager = AppManagerClient.new(HelperFunctions.local_ip())
 
     app_location = "/var/apps/#{APP_NAME}/app"
@@ -73,37 +65,8 @@ module AppDashboard
     Djinn.log_run("echo \"GLOBAL_SECRET_KEY = '#{secret}'\" > #{app_location}/lib/secret_key.py")
     Djinn.log_run("echo \"MY_PUBLIC_IP = '#{public_ip}'\" > #{app_location}/lib/local_host.py")
     Djinn.log_run("echo \"UA_SERVER_IP = '#{uaserver_ip}'\" > #{app_location}/lib/uaserver_host.py")
+    Djinn.log_debug("Done setting dashboard.")
 
-    Djinn.log_info("Starting #{APP_LANGUAGE} app #{APP_NAME}")
-    SERVER_PORTS.each { |port|
-      Djinn.log_debug("Starting #{APP_LANGUAGE} app #{APP_NAME} on #{HelperFunctions.local_ip()}:#{port}")
-      pid = app_manager.start_app(APP_NAME, port, uaserver_ip, APP_LANGUAGE,
-        login_ip, [uaserver_ip], {})
-      if pid == -1
-        Djinn.log_error("Failed to start app #{APP_NAME} on #{HelperFunctions.local_ip()}:#{port}")
-        return false
-      else
-        pid_file_name = "/etc/appscale/#{APP_NAME}-#{port}.pid"
-        HelperFunctions.write_file(pid_file_name, pid)
-      end
-    }
-
-    begin
-      Djinn.log_info("Priming AppDashboard's cache")
-      start_time = Time.now
-      url = URI.parse("http://#{HelperFunctions.local_ip()}:#{SERVER_PORTS[0]}/status/refresh")
-      http = Net::HTTP.new(url.host, url.port)
-      response = http.get(url.path)
-      end_time = Time.now
-      Djinn.log_debug("It took #{end_time - start_time} seconds to prime the AppDashboard's cache")
-    rescue Exception => e
-      # Don't crash the AppController because we weren't able to refresh the
-      # AppDashboard - just continue on.
-      Djinn.log_debug("Couldn't prime the AppDashboard's cache because of " +
-        "a #{e.class} exception.")
-    end
-
-    Nginx.reload()
     return true
   end
 
@@ -114,23 +77,19 @@ module AppDashboard
   def self.stop()
     Djinn.log_info("Stopping app #{APP_NAME} on #{HelperFunctions.local_ip()}")
     app_manager = AppManagerClient.new(HelperFunctions.local_ip())
-    if app_manager.stop_app(APP_NAME)
-      Djinn.log_error("Failed to start app #{APP_NAME} on #{HelperFunctions.local_ip()}")
-      return false
-    else
-      return true
+
+    app_stopped = false
+    begin
+      app_stopped = app_manager.stop_app(APP_NAME)
+    rescue FailedNodeException
+      app_stopped = false
     end
+
+    unless app_stopped
+      Djinn.log_error("Failed to stop app #{APP_NAME} on #{HelperFunctions.local_ip()}")
+    end
+
+    return app_stopped
   end
-
-
-  # Kills all AppServers hosting the AppDashboard, and then starts new
-  # AppServers to host it.
-  # Returns:
-  #   true if the AppDashboard started successfully, and false otherwise.
-  def self.restart
-    self.stop()
-    self.start()
-  end
-
 
 end

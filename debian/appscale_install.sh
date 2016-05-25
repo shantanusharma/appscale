@@ -5,6 +5,7 @@ fi
 
 DESTDIR=$2
 APPSCALE_HOME=${DESTDIR}${APPSCALE_HOME_RUNTIME}
+CURL_OPTS="-s"
 
 . debian/appscale_install_functions.sh
 
@@ -18,65 +19,21 @@ if [ -z "$1" ]; then
 fi
 
 case "$1" in
-    core)
+    # At this time we cannot simply install pieces of AppScale, and the
+    # space saving is minimal. So we install all the components.
+    all|core|cassandra)
         # Scratch install of appscale including post script.
         installappscaleprofile
         . /etc/profile.d/appscale.sh
         installgems
         postinstallhaproxy
         postinstallnginx
-        portinstallmonit
-        installPIL
-        installpythonmemcache
-        installlxml
-        installxmpppy
-        installappserverjava
-        installjavajdk
-        installappserverjava
-        installthrift
-        installtornado
-        installpycrypto 
-        postinstalltornado
-        installflexmock
-        installzookeeper
-        postinstallzookeeper
-        postinstallrabbitmq
-        installcelery
-        installservice
-        postinstallservice
-        setupntp
-        sethosts
-        setulimits
-        increaseconnections
-        ;;
-    cassandra)
-        installcassandra
-        postinstallcassandra
-        ;;
-        # For test only. this should be included in core and all.
-    zookeeper)
-        installzookeeper
-        postinstallzookeeper
-        ;;
-    rabbit-mq)
-        postinstallrabbitmq
-        ;; 
-    celery)
-        installcelery
-        ;;
-    all)
-        # Scratch install of appscale including post script.
-        installappscaleprofile
-        . /etc/profile.d/appscale.sh
-        installgems
-        postinstallhaproxy
-        postinstallnginx
-        portinstallmonit
         installPIL
         installpythonmemcache
         installlxml
         installxmpppy
         installjavajdk
+        installphp54
         installappserverjava
         installthrift
         installtornado
@@ -89,11 +46,18 @@ case "$1" in
         postinstallcassandra
         postinstallrabbitmq
         installcelery
+        installsolr
         installservice
         postinstallservice
-        setupntp
+        postinstallmonit
         sethosts
         setulimits
         increaseconnections
+        installVersion
+        installrequests
+        installpyopenssl
+        postinstallrsyslog
+        installpsutil
+        buildgo
         ;;
 esac

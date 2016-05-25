@@ -17,21 +17,35 @@ require 'helperfunctions'
 class UserAppClient
   attr_reader :conn, :ip, :secret
 
+  # The default name for the server.
+  NAME = "UserAppServer"
 
   # The port that the UserAppServer binds to, by default.
-  SERVER_PORT = 4343
+  SSL_SERVER_PORT = 4343
+
+  # The port the server is listening to.
+  SERVER_PORT = 4342
+
+  # The port used to have HAProxy in front of the UserAppServer.
+  HAPROXY_SERVER_PORT = 4341
+
+  # This is the minimum Timeout to use when talking to the datastore.
+  DS_MIN_TIMEOUT = 20
 
 
   def initialize(ip, secret)
     @ip = ip
     @secret = secret
-    
-    @conn = SOAP::RPC::Driver.new("https://#{@ip}:#{SERVER_PORT}")
+
+    @conn = SOAP::RPC::Driver.new("https://#{@ip}:#{SSL_SERVER_PORT}")
+    @conn.options["protocol.http.ssl_config.verify_mode"] = nil
     @conn.add_method("change_password", "user", "password", "secret")
     @conn.add_method("commit_new_user", "user", "passwd", "utype", "secret")
     @conn.add_method("commit_new_app", "user", "appname", "language", "secret")
     @conn.add_method("commit_tar", "app_name", "tar", "secret")
-    @conn.add_method("delete_app", "appname", "secret")    
+    @conn.add_method("delete_app", "appname", "secret")
+    @conn.add_method("does_app_exist", "appname", "secret")
+    @conn.add_method("enable_app", "appname", "secret")
     @conn.add_method("is_app_enabled", "appname", "secret")
     @conn.add_method("is_user_cloud_admin", "username", "secret")
     @conn.add_method("does_user_exist", "username", "secret")
@@ -39,48 +53,47 @@ class UserAppClient
     @conn.add_method("get_app_data", "appname", "secret")
     @conn.add_method("delete_instance", "appname", "host", "port", "secret")
     @conn.add_method("get_tar", "app_name", "secret")
-    @conn.add_method("add_instance", "appname", "host", "port", "secret")
+    @conn.add_method("add_instance", "appname", "host", "port", "https_port", "secret")
     @conn.add_method("get_all_apps", "secret")
     @conn.add_method("get_all_users", "secret")
+    @conn.add_method("set_cloud_admin_status", "username", "is_cloud_admin", "secret")
+    @conn.add_method("set_capabilities", "username", "capabilities", "secret")
   end
 
-  def make_call(timeout, retry_on_except, callr)
-    result = ""
-    Djinn.log_debug("Calling #{callr} on an UserAppServer at #{@ip}")
+
+  # Check the comments in AppController/lib/app_controller_client.rb.
+  def make_call(time, retry_on_except, callr)
     begin
-      Timeout::timeout(timeout) do
+      Timeout::timeout(time) {
         begin
           yield if block_given?
+        rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH,
+          OpenSSL::SSL::SSLError, NotImplementedError, Errno::EPIPE,
+          Errno::ECONNRESET, SOAP::EmptyResponseError, StandardError => e
+          if retry_on_except
+            Kernel.sleep(1)
+            Djinn.log_debug("[#{callr}] exception in make_call to " +
+              "#{@ip}:#{SERVER_PORT}. Exception class: #{e.class}. Retrying...")
+            retry
+          else
+            trace = e.backtrace.join("\n")
+            Djinn.log_warn("Exception encountered while talking to " +
+              "#{@ip}:#{SERVER_PORT}.\n#{trace}")
+            raise FailedNodeException.new("Exception #{e.class}:#{e.message} encountered " +
+              "while talking to #{@ip}:#{SERVER_PORT}.")
+          end
         end
-      end
-    rescue OpenSSL::SSL::SSLError
-      Djinn.log_warn("Retrying (SSL) - calling #{callr} on UserAppServer at #{@ip}")
-      retry
-    rescue Errno::ECONNREFUSED
-      if retry_on_except
-        sleep(1)
-        Djinn.log_warn("Retrying (ConnRefused) - calling #{callr} on UserAppServer at #{@ip}")
-        retry
-      else
-        HelperFunctions.log_and_crash("We were unable to establish a " +
-          "connection with the UserAppServer at the designated location. Is " +
-          "AppScale currently running?")
-      end 
-   rescue Exception => except
-      if except.class == Interrupt
-        HelperFunctions.log_and_crash("Saw an Interrupt when talking to the " +
-          "UserAppServer")
-      end
-
-      Djinn.log_warn("An exception of type #{except.class} was thrown.")
-      Djinn.log_warn("Retrying - calling #{callr} on UserAppServer at #{@ip}")
-      retry if retry_on_except
+      }
+    rescue Timeout::Error
+      Djinn.log_warn("[#{callr}] SOAP call to #{@ip} timed out")
+      raise FailedNodeException.new("Time out talking to #{@ip}:#{SERVER_PORT}")
     end
   end
-  
+
+
   def commit_new_user(user, encrypted_password, user_type, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "commit_new_user") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "commit_new_user") {
       result = @conn.commit_new_user(user, encrypted_password, user_type, @secret)
     }
 
@@ -94,15 +107,15 @@ class UserAppClient
     end
     return result
   end
-  
+
   def commit_new_app(user, app_name, language, file_location)
     commit_new_app_name(user, app_name, language)
     commit_tar(app_name, file_location)
   end
-  
+
   def commit_new_app_name(user, app_name, language, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "commit_new_app_name") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "commit_new_app_name") {
       result = @conn.commit_new_app(user, app_name, language, @secret)
     }
 
@@ -117,17 +130,18 @@ class UserAppClient
     else
       puts "[unexpected] Commit new app says: [#{result}]"
     end
+    return result
   end
-  
+
   def commit_tar(app_name, file_location, retry_on_except=true)
     file = File.open(file_location, "rb")
     tar_contents = Base64.encode64(file.read)
-    
+
     result = ""
-    make_call(300, retry_on_except, "commit_tar") {
+    make_call(DS_MIN_TIMEOUT * 25, retry_on_except, "commit_tar") {
       result = @conn.commit_tar(app_name, tar_contents, @secret)
     }
- 
+
     if result == "true"
       puts "#{app_name} was uploaded successfully."
     elsif result == "Error: app does not exist"
@@ -138,13 +152,13 @@ class UserAppClient
       puts "[unexpected] Commit new tar says: [#{result}]"
     end
   end
-  
+
   def change_password(user, new_password, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "change_password") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "change_password") {
       result = @conn.change_password(user, new_password, @secret)
     }
-        
+
     if result == "true"
       puts "We successfully changed the password for the given user."
     elsif result == "Error: user not found"
@@ -152,46 +166,73 @@ class UserAppClient
     else
       puts "[unexpected] Got this message back: [#{result}]"
     end
+    return result
   end
 
   def delete_app(app, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "delete_app") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "delete_app") {
       result = @conn.delete_app(app, @secret)
     }
-    
+
     if result == "true"
       return true
     else
       return result
-    end  
+    end
   end
 
   def does_app_exist?(app, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "does_app_exist") {
-      result = @conn.is_app_enabled(app, @secret)
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "does_app_exist") {
+      result = @conn.does_app_exist(app, @secret)
     }
-    
+
     if result == "true"
       return true
     else
       return false
     end
   end
-  
+
+  def is_app_enabled?(app, retry_on_except=true)
+    result = ""
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "is_app_enabled") {
+      result = @conn.is_app_enabled(app, @secret)
+    }
+
+    if result == "true"
+      return true
+    else
+      return false
+    end
+  end
+
   def does_user_exist?(user, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "does_user_exist") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "does_user_exist") {
       result = @conn.does_user_exist(user, @secret)
     }
-    
+
     return result
+  end
+
+  def enable_app(app, retry_on_except=true)
+    result = ""
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "enable_app") {
+      result = @conn.enable_app(app, @secret)
+    }
+
+    if result == "true"
+      return true
+    else
+      return result
+    end
   end
 
   def get_user_data(username, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "get_user_data") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "get_user_data") {
       result = @conn.get_user_data(username, @secret)
     }
 
@@ -200,16 +241,21 @@ class UserAppClient
 
   def get_app_data(appname, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "get_app_data") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "get_app_data") {
       result = @conn.get_app_data(appname, @secret)
     }
+    if result[0..4] == "Error"
+      msg = "get_app_data: failed to get data for app #{appname}."
+      Djinn.log_debug(msg)
+      raise FailedNodeException.new(msg)
+    end
 
     return result
   end
 
   def delete_instance(appname, host, port, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "delete_instance") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "delete_instance") {
       result = @conn.delete_instance(appname, host, port, @secret)
     }
 
@@ -218,7 +264,7 @@ class UserAppClient
 
   def get_all_apps(retry_on_except=true)
     all_apps = ""
-    make_call(10, retry_on_except, "get_all_apps") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "get_all_apps") {
       all_apps = @conn.get_all_apps(@secret)
     }
 
@@ -229,7 +275,7 @@ class UserAppClient
 
   def get_all_users(retry_on_except=true)
     all_users = ""
-    make_call(10, retry_on_except, "get_all_users") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "get_all_users") {
       all_users = @conn.get_all_users(@secret)
     }
 
@@ -240,18 +286,24 @@ class UserAppClient
 
   def get_tar(appname, retry_on_except=true)
     result = ""
-    make_call(300, retry_on_except, "get_tar") {
+    make_call(DS_MIN_TIMEOUT * 25, retry_on_except, "get_tar") {
       result = @conn.get_tar(appname, @secret)
     }
 
     return result
   end
 
-  def add_instance(appname, host, port, retry_on_except=true)
+  def add_instance(appname, host, port, https_port, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "add_instance") {
-      result = @conn.add_instance(appname, host, port, @secret)
-    }
+    begin
+      make_call(DS_MIN_TIMEOUT, retry_on_except, "add_instance") {
+        result = @conn.add_instance(appname, host, port, https_port, @secret)
+      }
+    rescue FailedNodeException
+      Djinn.log_error("Exception talking to the UserAppServer. " +
+        "#{appname} may not have been updated.")
+      return false
+    end
 
     if result == "true"
       return true
@@ -269,31 +321,15 @@ class UserAppClient
 
   def is_user_cloud_admin?(user, retry_on_except=true)
     result = ""
-    make_call(10, retry_on_except, "is_user_cloud_admin") {
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "is_user_cloud_admin") {
       result = @conn.is_user_cloud_admin(user, @secret)
     }
-   
+
     if result == "true"
       return true
     else
       return false
     end
-  end
- 
-  # This method returns an array of strings, each corresponding to a
-  # ip:port that the given app is hosted at.
-  def get_hosts_for_app(appname)
-    app_data = get_app_data(appname)
-    hosts = app_data.scan(/\nhosts:([\d\.|:]+)\n/).flatten.to_s.split(":")
-    ports = app_data.scan(/\nports: ([\d|:]+)\n/).flatten.to_s.split(":")
-
-    host_list = []
-
-    hosts.each_index { |i|
-      host_list << "#{hosts[i]}:#{ports[i]}"
-    }
-
-    return host_list
   end
 
   # This method finds the first user who is a cloud administrator. Since the
@@ -310,4 +346,48 @@ class UserAppClient
 
     raise Exception.new("Couldn't find a cloud administrator")
   end
+
+  def set_admin_role(username, is_cloud_admin, capabilities, retry_on_except=true)
+    result_cloud_admin_status = set_cloud_admin_status(username, is_cloud_admin, retry_on_except)
+    result_set_capabilities = set_capabilities(username, capabilities, retry_on_except)
+    if result_cloud_admin_status and result_set_capabilities == "true"
+      puts "We successfully set admin role for the given user."
+      return "true"
+    else
+      puts "Got this message back while setting cloud admin status and capabilities:" +
+        "Set cloud admin status: [#{result_cloud_admin_status}]" +
+        "Set capabilities: [#{result_set_capabilities}]"
+    end
+  end
+
+  def set_cloud_admin_status(username, is_cloud_admin, retry_on_except)
+    result = ""
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "set_cloud_admin_status") {
+      result = @conn.set_cloud_admin_status(username, is_cloud_admin, @secret)
+    }
+    if result == "true"
+      puts "We successfully set cloud admin status for the given user."
+    elsif result == "Error: user not found"
+      puts "We were unable to locate a user with the given username."
+    else
+      puts "[unexpected] Got this message back: [#{result}]"
+    end
+    return result
+  end
+
+  def set_capabilities(username, capabilities, retry_on_except)
+    result = ""
+    make_call(DS_MIN_TIMEOUT, retry_on_except, "set_capabilities") {
+      result = @conn.set_capabilities(username, capabilities, @secret)
+    }
+    if result == "true"
+      puts "We successfully set admin capabilities for the given user."
+    elsif result == "Error: user not found"
+      puts "We were unable to locate a user with the given username."
+    else
+      puts "[unexpected] Got this message back: [#{result}]"
+    end
+    return result
+  end
+
 end

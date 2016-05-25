@@ -51,6 +51,9 @@ class AppControllerClient
   # be found on the machine that ran that tool, or on any AppScale machine.
   attr_accessor :secret
 
+  # The port that the AppController binds to, by default.
+  SERVER_PORT = 17443
+
 
   # A constructor that requires both the IP address of the machine to communicate
   # with as well as the secret (string) needed to perform communication.
@@ -61,12 +64,15 @@ class AppControllerClient
     @ip = ip
     @secret = secret
     
-    @conn = SOAP::RPC::Driver.new("https://#{@ip}:17443")
+    @conn = SOAP::RPC::Driver.new("https://#{@ip}:#{SERVER_PORT}")
+    # Disable certificate verification.
+    @conn.options["protocol.http.ssl_config.verify_mode"] = nil
     @conn.add_method("set_parameters", "djinn_locations", "database_credentials", "app_names", "secret")
     @conn.add_method("set_apps", "app_names", "secret")
     @conn.add_method("set_apps_to_restart", "apps_to_restart", "secret")
     @conn.add_method("status", "secret")
     @conn.add_method("get_stats", "secret")
+    @conn.add_method("upload_app", "app", "secret")
     @conn.add_method("update", "app_names", "secret")
     @conn.add_method("stop_app", "app_name", "secret")    
     @conn.add_method("get_all_public_ips", "secret")
@@ -75,16 +81,18 @@ class AppControllerClient
     @conn.add_method("add_role", "new_role", "secret")
     @conn.add_method("remove_role", "old_role", "secret")
     @conn.add_method("get_queues_in_use", "secret")
-    @conn.add_method("add_appserver_to_haproxy", "app_id", "ip", "port",
-      "secret")
-    @conn.add_method("remove_appserver_from_haproxy", "app_id", "ip", "port",
-      "secret")
-    @conn.add_method("add_appserver_process", "app_id", "secret")
-    @conn.add_method("remove_appserver_process", "app_id", "port", "secret")
+    @conn.add_method("set_node_read_only", "read_only", "secret")
   end
-  
 
-  # Provides automatic retry logic for transient SOAP errors.
+
+  # Provides automatic retry logic for transient SOAP errors. This code is
+  # used in few other clients (it should be made in a library):
+  #   lib/infrastructure_manager_client.rb
+  #   lib/user_app_client.rb
+  #   lib/taskqueue_client.rb
+  #   lib/app_manager_client.rb
+  #   lib/app_controller_client.rb
+  # Modification in this function should be reflected on the others too.
   #
   # Args:
   #   time: A Fixnum that indicates how long the timeout should be set to when
@@ -103,77 +111,42 @@ class AppControllerClient
   #   The result of the block that was executed, or nil if the timeout was
   #   exceeded.
   def make_call(time, retry_on_except, callr)
-    refused_count = 0
-    max = 5
-
     begin
       Timeout::timeout(time) {
-        yield if block_given?
+        begin
+          yield if block_given?
+        rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH,
+          OpenSSL::SSL::SSLError, NotImplementedError, Errno::EPIPE,
+          Errno::ECONNRESET, SOAP::EmptyResponseError, StandardError => e
+          if retry_on_except
+            Kernel.sleep(1)
+            Djinn.log_debug("[#{callr}] exception in make_call to " +
+              "#{@ip}:#{SERVER_PORT}. Exception class: #{e.class}. Retrying...")
+            retry
+          else
+            trace = e.backtrace.join("\n")
+            Djinn.log_warn("Exception encountered while talking to " +
+              "#{@ip}:#{SERVER_PORT}.\n#{trace}")
+            raise FailedNodeException.new("Exception #{e.class}:#{e.message} encountered " +
+              "while talking to #{@ip}:#{SERVER_PORT}.")
+          end
+        end
       }
-    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH
-      if refused_count > max
-        raise FailedNodeException.new("Connection was refused. Is the " +
-          "AppController running?")
-      else
-        refused_count += 1
-        Kernel.sleep(1)
-        retry
-      end
     rescue Timeout::Error
       Djinn.log_warn("[#{callr}] SOAP call to #{@ip} timed out")
-      return
-    rescue OpenSSL::SSL::SSLError, NotImplementedError, Errno::EPIPE,
-      Errno::ECONNRESET, SOAP::EmptyResponseError
-      retry
-    rescue Exception => except
-      if retry_on_except
-        retry
-      else
-        trace = except.backtrace.join("\n")
-        HelperFunctions.log_and_crash("[#{callr}] We saw an unexpected error" +
-          " of the type #{except.class} with the following message:\n" +
-          "#{except}, with trace: #{trace}")
-      end
+      raise FailedNodeException.new("Time out talking to #{@ip}:#{SERVER_PORT}")
     end
   end
 
-
-  def get_userappserver_ip(verbose_level="low") 
-    userappserver_ip, status, state, new_state = "", "", "", ""
-    loop {
-      status = get_status()
-
-      new_state = status.scan(/Current State: ([\w\s\d\.,]+)\n/).flatten.to_s.chomp
-      if verbose_level == "high" and new_state != state
-        puts new_state
-        state = new_state
-      end
-    
-      if status == "false: bad secret"
-        HelperFunctions.log_and_crash("\nWe were unable to verify your " +
-          "secret key with the head node specified in your locations " +
-          "file. Are you sure you have the correct secret key and locations " +
-          "file?\n\nSecret provided: [#{@secret}]\nHead node IP address: " +
-          "[#{@ip}]\n")
-      end
-        
-      if status =~ /Database is at (#{IP_OR_FQDN})/ and $1 != "not-up-yet"
-        userappserver_ip = $1
-        break
-      end
-      
-      sleep(10)
-    }
-    
-    return userappserver_ip
-  end
 
   def set_parameters(locations, options, apps_to_start)
     result = ""
     make_call(10, ABORT_ON_FAIL, "set_parameters") { 
       result = conn.set_parameters(locations, options, apps_to_start, @secret)
     }  
-    HelperFunctions.log_and_crash(result) if result =~ /Error:/
+    if result =~ /Error:/
+      raise FailedNodeException.new("set_parameters returned #{result}.")
+    end
   end
 
   def set_apps(app_names)
@@ -181,7 +154,9 @@ class AppControllerClient
     make_call(10, ABORT_ON_FAIL, "set_apps") { 
       result = conn.set_apps(app_names, @secret)
     }  
-    HelperFunctions.log_and_crash(result) if result =~ /Error:/
+    if result =~ /Error:/
+      raise FailedNodeException.new("set_apps returned #{result}.")
+    end
   end
 
   def status(print_output=true)
@@ -197,7 +172,7 @@ class AppControllerClient
 
   def get_status()
     if !HelperFunctions.is_port_open?(@ip, 17443)
-      HelperFunctions.log_and_crash("AppController at #{@ip} is not running")
+      raise FailedNodeException.new("Cannot talk to AppController at #{@ip}.")
     end
 
     make_call(10, RETRY_ON_FAIL, "get_status") { @conn.status(@secret) }
@@ -205,6 +180,10 @@ class AppControllerClient
 
   def get_stats()
     make_call(10, RETRY_ON_FAIL, "get_stats") { @conn.get_stats(@secret) }
+  end
+
+  def upload_app(app)
+    make_call(30, RETRY_ON_FAIL, "upload_app") { @conn.upload_app(app, @secret) }
   end
 
   def stop_app(app_name)
@@ -238,29 +217,6 @@ class AppControllerClient
     make_call(NO_TIMEOUT, RETRY_ON_FAIL, "remove_role") { @conn.remove_role(role, @secret) }
   end
 
-  def wait_for_node_to_be(new_roles)
-    roles = new_roles.split(":")
-
-    loop {
-      ready = true
-      status = get_status
-      Djinn.log_debug("ACC: Node at #{@ip} said [#{status}]")
-      roles.each { |role|
-        if status =~ /#{role}/
-          Djinn.log_debug("ACC: Node is #{role}")
-        else
-          ready = false
-          Djinn.log_debug("ACC: Node is not yet #{role}")
-        end
-      }
-
-      break if ready      
-    }
-
-    Djinn.log_debug("ACC: Node at #{@ip} is now #{new_roles}")
-    return
-  end
-
   def get_queues_in_use()
     make_call(NO_TIMEOUT, RETRY_ON_FAIL, "get_queues_in_use") { 
       @conn.get_queues_in_use(@secret)
@@ -279,48 +235,10 @@ class AppControllerClient
     }
   end
 
-  # Tells an AppController to route HAProxy traffic to the given location.
-  #
-  # Args:
-  #   app_id: A String that identifies the application that runs the new
-  #     AppServer.
-  #   ip: A String that identifies the private IP address where the new
-  #     AppServer runs.
-  #   port: A Fixnum that identifies the port where the new AppServer runs at
-  #     ip.
-  #   secret: A String that is used to authenticate the caller.
-  def add_appserver_to_haproxy(app_id, ip, port)
-    make_call(NO_TIMEOUT, RETRY_ON_FAIL, "add_appserver_to_haproxy") {
-      @conn.add_appserver_to_haproxy(app_id, ip, port, @secret)
-    }
-  end
-
-  # Tells an AppController to no longer route HAProxy traffic to the given
-  # location.
-  #
-  # Args:
-  #   app_id: A String that identifies the application that runs the AppServer
-  #     to remove.
-  #   ip: A String that identifies the private IP address where the AppServer
-  #     to remove runs.
-  #   port: A Fixnum that identifies the port where the AppServer was running.
-  #   secret: A String that is used to authenticate the caller.
-  def remove_appserver_from_haproxy(app_id, ip, port)
-    make_call(NO_TIMEOUT, RETRY_ON_FAIL, "remove_appserver_from_haproxy") {
-      @conn.remove_appserver_from_haproxy(app_id, ip, port, @secret)
-    }
-  end
-
-
-  def add_appserver_process(app_id)
-    make_call(NO_TIMEOUT, RETRY_ON_FAIL, "add_appserver_process") {
-      @conn.add_appserver_process(app_id, @secret)
-    }
-  end
-
-  def remove_appserver_process(app_id, port)
-    make_call(NO_TIMEOUT, RETRY_ON_FAIL, "remove_appserver_process") {
-      @conn.remove_appserver_process(app_id, port, @secret)
+  # Enables or disables datastore writes on the remote database node.
+  def set_node_read_only(read_only)
+    make_call(NO_TIMEOUT, RETRY_ON_FAIL, "set_node_read_only") {
+      @conn.set_node_read_only(read_only, @secret)
     }
   end
 

@@ -5,10 +5,56 @@ to AppScale and the current node/machine.
 import json
 import logging
 import multiprocessing
+import os
+import sys
 import yaml
 
 import constants
 import file_io
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '../AppServer'))
+from google.appengine.api.appcontroller_client import AppControllerClient
+
+def read_file_contents(path):
+  """ Reads the contents of the given file.
+
+  Returns:
+    A str, the contents of the given file.
+  """
+  with open(path) as file_handle:
+    return file_handle.read()
+
+def get_appcontroller_client():
+  """ Returns an AppControllerClient instance for this deployment. """
+  head_node_ip_file = '/etc/appscale/head_node_ip'
+  head_node = read_file_contents(head_node_ip_file).rstrip('\n')
+
+  secret_file = '/etc/appscale/secret.key'
+  secret = read_file_contents(secret_file)
+
+  return AppControllerClient(head_node, secret)
+
+def get_keyname():
+  """ Returns the keyname for this deployment. """
+  return get_db_info()[':keyname']
+
+def get_all_ips():
+  """ Get the IPs for all deployment nodes.
+
+  Returns:
+    A list of node IPs.
+  """
+  nodes = file_io.read(constants.ALL_IPS_LOC)
+  nodes = nodes.split('\n')
+  return filter(None, nodes)
+
+def get_login_ip():
+  """ Get the public IP of the head node.
+
+  Returns:
+    String containing the public IP of the head node.
+  """
+  return file_io.read(constants.LOGIN_IP_LOC).rstrip()
 
 def get_private_ip():
   """ Get the private IP of the current machine.
@@ -84,7 +130,7 @@ def get_zk_locations_string():
   try:
     info = file_io.read(constants.ZK_LOCATIONS_JSON_FILE) 
     zk_json = json.loads(info) 
-    return ":2181".join(zk_json['locations']) + ":2181"
+    return ":2181,".join(zk_json['locations']) + ":2181"
   except IOError, io_error:
     logging.exception(io_error)
     return constants.ZK_DEFAULT_CONNECTION_STR
@@ -98,6 +144,30 @@ def get_zk_locations_string():
     logging.exception(key_error)
     return constants.ZK_DEFAULT_CONNECTION_STR
 
+def get_zk_node_ips():
+  """ Returns a list of zookeeper node IPs.
+
+  Returns:
+    A list containing the hosts that run zookeeper roles in the current
+    AppScale deployment.
+  """
+  try:
+    info = file_io.read(constants.ZK_LOCATIONS_JSON_FILE)
+    zk_json = json.loads(info)
+    return zk_json['locations']
+  except IOError, io_error:
+    logging.exception(io_error)
+    return []
+  except ValueError, value_error:
+    logging.exception(value_error)
+    return []
+  except TypeError, type_error:
+    logging.exception(type_error)
+    return []
+  except KeyError, key_error:
+    logging.exception(key_error)
+    return []
+
 def get_db_master_ip():
   """ Returns the master datastore IP.
 
@@ -105,3 +175,36 @@ def get_db_master_ip():
     A str, the IP of the datastore master.
   """
   return file_io.read(constants.MASTERS_FILE_LOC).rstrip()
+
+def get_db_slave_ips():
+  """ Returns the slave datastore IPs.
+
+  Returns:
+    A list of IP of the datastore slaves.
+  """
+  nodes = file_io.read(constants.SLAVES_FILE_LOC).rstrip()
+  nodes = nodes.split('\n')
+  if nodes[-1] == '':
+    nodes = nodes[:-1]
+  return nodes
+
+def get_db_ips():
+  """ Returns a list of database machines.
+
+  Returns:
+    A list of strings containing IP addresses.
+  """
+  return list(set([get_db_master_ip()] + get_db_slave_ips()))
+
+def get_search_location():
+  """ Returns the IP and port of where the search service is running.
+
+  Returns:
+    A str, the IP and port in the format: IP:PORT. Empty string if the service
+    is not available.
+  """
+  try:
+    return file_io.read(constants.SEARCH_FILE_LOC).rstrip()
+  except IOError:
+    logging.warning("Search role is not configured.")
+    return ""

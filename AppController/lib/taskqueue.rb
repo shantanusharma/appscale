@@ -2,6 +2,7 @@
 
 
 # First-party Ruby libraries
+require 'resolv'
 require 'timeout'
 
 
@@ -30,9 +31,6 @@ module TaskQueue
   # The port where the Flower server runs on, by default.
   FLOWER_SERVER_PORT = 5555
 
-  # The python executable path.
-  PYTHON_EXEC = "python"
-
   # The path to the file that the shared secret should be written to.
   COOKIE_FILE = "/var/lib/rabbitmq/.erlang.cookie"
 
@@ -47,9 +45,6 @@ module TaskQueue
 
   # How many times to retry starting rabbitmq on a slave.
   RABBIT_START_RETRY = 1000
-
-  # Stop command for taskqueue server.
-  TASKQUEUE_STOP_CMD = "/bin/kill -9 `ps aux | grep taskqueue_server.py | awk {'print $2'}`"
 
   # Location where celery workers back up state to.
   CELERY_STATE_DIR = "/opt/appscale/celery"
@@ -73,11 +68,11 @@ module TaskQueue
 
     # First, start up RabbitMQ.
     Djinn.log_run("mkdir -p #{CELERY_STATE_DIR}")
-    start_cmd = "/usr/sbin/rabbitmq-server -detached -setcookie #{HelperFunctions.get_secret()}"
+    start_cmd = "/usr/sbin/rabbitmq-server -detached -setcookie #{HelperFunctions.get_taskqueue_secret()}"
     stop_cmd = "/usr/sbin/rabbitmqctl stop"
     match_cmd = "sname rabbit"
     MonitInterface.start(:rabbitmq, start_cmd, stop_cmd, ports=9999,
-      env_vars=nil, remote_ip=nil, remote_key=nil, match_cmd=match_cmd)
+      env_vars=nil, match_cmd=match_cmd)
 
     # Next, start up the TaskQueue Server.
     start_taskqueue_server()
@@ -112,11 +107,29 @@ module TaskQueue
     Djinn.log_debug("Waiting for RabbitMQ on master node to come up")
     HelperFunctions.sleep_until_port_is_open(master_ip, SERVER_PORT)
 
-    # start the server, reset it to join the head node
-    hostname = `hostname`.chomp()
-    start_cmds = ["/usr/sbin/rabbitmq-server -detached -setcookie #{HelperFunctions.get_secret()}",
-                  "/usr/sbin/rabbitmqctl cluster rabbit@#{hostname}",
-                  "/usr/sbin/rabbitmqctl start_app"]
+    # Start the server, reset it to join the head node. To do this we need
+    # the hostname of the master node. We go through few options:
+    # - the old one is to look into /etc/hosts for it
+    # - another one is to just try to resolve it
+    # - finally we give up and use the IP address
+    master_tq_host = `cat /etc/hosts | grep #{master_ip} | tr -s \" \" | cut -d \" \" -f2`.chomp
+    if master_tq_host.empty?
+      begin
+        master_tq_host = Resolv.getname(master_ip)
+      rescue Resolv::ResolvError
+        # We couldn't get the name: let's try to use the IP address.
+        master_tq_host = master_ip
+      end
+    end
+
+    start_cmds = [
+      # Restarting the RabbitMQ server ensures that we read the correct cookie.
+      "service rabbitmq-server restart",
+      "/usr/sbin/rabbitmqctl stop_app",
+      # Read master hostname given the master IP.
+      "/usr/sbin/rabbitmqctl cluster rabbit@#{master_tq_host}",
+      "/usr/sbin/rabbitmqctl start_app"
+    ]
     full_cmd = "#{start_cmds.join('; ')}"
     stop_cmd = "/usr/sbin/rabbitmqctl stop"
     match_cmd = "sname rabbit"
@@ -124,7 +137,7 @@ module TaskQueue
     tries_left = RABBIT_START_RETRY
     loop {
       MonitInterface.start(:rabbitmq, full_cmd, stop_cmd, ports=9999,
-        env_vars=nil, remote_ip=nil, remote_key=nil, match_cmd=match_cmd)
+        env_vars=nil, match_cmd=match_cmd)
       Djinn.log_debug("Waiting for RabbitMQ on local node to come up")
       begin
         Timeout::timeout(MAX_WAIT_FOR_RABBITMQ) do
@@ -159,8 +172,9 @@ module TaskQueue
   def self.start_taskqueue_server()
     Djinn.log_debug("Starting taskqueue_server on this node")
     script = "#{APPSCALE_HOME}/AppTaskQueue/taskqueue_server.py"
-    start_cmd = "#{PYTHON_EXEC} #{script}"
-    stop_cmd = TASKQUEUE_STOP_CMD
+    start_cmd = "/usr/bin/python2 #{script}"
+    stop_cmd = "/usr/bin/python2 #{APPSCALE_HOME}/scripts/stop_service.py " +
+          "#{script} /usr/bin/python2"
     env_vars = {}
     MonitInterface.start(:taskqueue, start_cmd, stop_cmd, TASKQUEUE_SERVER_PORT,
       env_vars)
@@ -170,7 +184,7 @@ module TaskQueue
   # Stops the RabbitMQ, celery workers, and taskqueue server on this node.
   def self.stop()
     Djinn.log_debug("Shutting down celery workers")
-    stop_cmd = "python -c \"import celery; celery = celery.Celery(); celery.control.broadcast('shutdown')\""
+    stop_cmd = "/usr/bin/python2 -c \"import celery; celery = celery.Celery(); celery.control.broadcast('shutdown')\""
     Djinn.log_run(stop_cmd)
     Djinn.log_debug("Shutting down RabbitMQ")
     MonitInterface.stop(:rabbitmq)
@@ -179,19 +193,19 @@ module TaskQueue
 
   # Stops the AppScale TaskQueue server.
   def self.stop_taskqueue_server()
+    script = "#{APPSCALE_HOME}/AppTaskQueue/taskqueue_server.py"
     Djinn.log_debug("Stopping taskqueue_server on this node")
-    Djinn.log_run(TASKQUEUE_STOP_CMD)
+    Djinn.log_run("/usr/bin/python2 #{APPSCALE_HOME}/scripts/stop_service.py #{script} /usr/bin/python2")
     MonitInterface.stop(:taskqueue)
     Djinn.log_debug("Done stopping taskqueue_server on this node")
   end
 
   # Erlang processes use a secret value as a password to authenticate between
   # one another. Since this is pretty much the same thing we do in AppScale
-  # with our secret key, use the same key here.
-  # TODO: Consider using a different key, so that if one key is compromised
-  # it doesn't compromise the other.
+  # with our secret key, use the same key here but hashed as to not reveal the 
+  # actual key.
   def self.write_cookie()
-    HelperFunctions.write_file(COOKIE_FILE, HelperFunctions.get_secret())
+    HelperFunctions.write_file(COOKIE_FILE, HelperFunctions.get_taskqueue_secret())
   end
 
 
@@ -214,7 +228,8 @@ module TaskQueue
   #   flower_password: A String that is used as the password to log into flower.
   def self.start_flower(flower_password)
     start_cmd = "/usr/local/bin/flower --basic_auth=appscale:#{flower_password}"
-    stop_cmd = "/bin/ps ax | /bin/grep flower | /bin/grep -v grep | /usr/bin/awk '{print $1}' | xargs kill -9"
+    stop_cmd = "/usr/bin/python2 #{APPSCALE_HOME}/scripts/stop_service.py " +
+          "flower #{flower_password}"
     MonitInterface.start(:flower, start_cmd, stop_cmd, FLOWER_SERVER_PORT)
   end
 

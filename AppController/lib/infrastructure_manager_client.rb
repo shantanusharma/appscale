@@ -5,6 +5,7 @@ require 'openssl'
 require 'soap/rpc/driver'
 require 'timeout'
 
+require 'json'
 
 # Imports for the AppController
 $:.unshift File.join(File.dirname(__FILE__), "..")
@@ -49,74 +50,52 @@ class InfrastructureManagerClient
 
 
   def initialize(secret)
-    ip = HelperFunctions.local_ip()
+    @ip = HelperFunctions.local_ip()
     @secret = secret
     
-    @conn = SOAP::RPC::Driver.new("https://#{ip}:#{SERVER_PORT}")
+    @conn = SOAP::RPC::Driver.new("https://#{@ip}:#{SERVER_PORT}")
+    # We used self signed certificates. Don't verify them.
+    @conn.options["protocol.http.ssl_config.verify_mode"] = nil
     @conn.add_method("get_queues_in_use", "secret")
     @conn.add_method("run_instances", "parameters", "secret")
     @conn.add_method("describe_instances", "parameters", "secret")
     @conn.add_method("terminate_instances", "parameters", "secret")
     @conn.add_method("attach_disk", "parameters", "disk_name", "instance_id",
       "secret")
+    @conn.add_method("get_cpu_usage", "secret")
+    @conn.add_method("get_disk_usage", "secret")
+    @conn.add_method("get_memory_usage", "secret")
+    @conn.add_method("get_service_summary", "secret")
+    @conn.add_method("get_swap_usage", "secret")
   end
   
 
-  # A helper method that makes SOAP calls for us. This method is mainly here to
-  # reduce code duplication: all SOAP calls expect a certain timeout and can
-  # tolerate certain exceptions, so we consolidate this code into this method.
-  # Here, the caller specifies the timeout for the SOAP call (or NO_TIMEOUT
-  # if an infinite timeout is required) as well as whether the call should
-  # be retried in the face of exceptions. Exceptions can occur if the machine
-  # is not yet running or is too busy to handle the request, so these exceptions
-  # are automatically retried regardless of the retry value. Typically
-  # callers set this to false to catch 'Connection Refused' exceptions or
-  # the like. Finally, the caller must provide a block of
-  # code that indicates the SOAP call to make: this is really all that differs
-  # between the calling methods. The result of the block is returned to the
-  # caller. 
-  def make_call(time, retry_on_except, callr, ok_to_fail=false)
-    refused_count = 0
-    max = 5
-
+  # Check the comments in AppController/lib/app_controller_client.rb.
+  def make_call(time, retry_on_except, callr)
     begin
       Timeout::timeout(time) {
-        yield if block_given?
+        begin
+          yield if block_given?
+        rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH,
+          OpenSSL::SSL::SSLError, NotImplementedError, Errno::EPIPE,
+          Errno::ECONNRESET, SOAP::EmptyResponseError, StandardError => e
+          if retry_on_except
+            Kernel.sleep(1)
+            Djinn.log_debug("[#{callr}] exception in make_call to " +
+              "#{@ip}:#{SERVER_PORT}. Exception class: #{e.class}. Retrying...")
+            retry
+          else
+            trace = e.backtrace.join("\n")
+            Djinn.log_warn("Exception encountered while talking to " +
+              "#{@ip}:#{SERVER_PORT}.\n#{trace}")
+            raise FailedNodeException.new("Exception #{e.class}:#{e.message} encountered " +
+              "while talking to #{@ip}:#{SERVER_PORT}.")
+          end
+        end
       }
-    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH => except
-      Djinn.log_warn("Saw an Exception of class #{except.class}")
-      if refused_count > max
-        return false if ok_to_fail
-        Djinn.log_fatal("Connection refused. Is the AppController running?")
-        raise AppScaleException.new("Connection was refused. Is the " +
-          "AppController running?")
-      else
-        refused_count += 1
-        Kernel.sleep(1)
-        retry
-      end
     rescue Timeout::Error
-      Djinn.log_warn("Saw a Timeout Error")
-      return false if ok_to_fail
-      retry
-    rescue OpenSSL::SSL::SSLError, NotImplementedError, Errno::EPIPE, Errno::ECONNRESET => except
-      Djinn.log_warn("Saw an Exception of class #{except.class}")
-      Kernel.sleep(1)
-      retry
-    rescue Exception => except
-      newline = "\n"
-      Djinn.log_warn("Saw an Exception of class #{except.class}")
-      Djinn.log_warn("#{except.backtrace.join(newline)}")
-
-      if retry_on_except
-        Kernel.sleep(1)
-        retry
-      else
-        Djinn.log_fatal("Couldn't recover from a #{except.class} Exception, " +
-          "with message: #{except}")
-        raise AppScaleException.new("[#{callr}] We saw an unexpected error of" +
-          " the type #{except.class} with the following message:\n#{except}.")
-      end
+      Djinn.log_warn("[#{callr}] SOAP call to #{@ip} timed out")
+      raise FailedNodeException.new("Time out talking to #{@ip}:#{SERVER_PORT}")
     end
   end
 
@@ -203,7 +182,8 @@ class InfrastructureManagerClient
     vm_info = {}
     loop {
       describe_result = describe_instances("reservation_id" => reservation_id)
-      Djinn.log_debug("[IM] Describe instances info says [#{describe_result}]")
+      Djinn.log_debug("[IM] Describe instances state is #{describe_result['state']} " +
+        "and vm_info is #{describe_result['vm_info']}.")
 
       if describe_result["state"] == "running"
         vm_info = describe_result["vm_info"]
@@ -266,6 +246,41 @@ class InfrastructureManagerClient
       Djinn.log_debug("Attach disk returned #{disk_info.inspect}")
       return disk_info['location']
     }
+  end
+
+
+
+  # Retrieves system monitoring statistics from the SystemManager.
+  # Returns:
+  #  A hash of the all the stats combined.
+  def get_system_stats()
+    Djinn.log_debug("Calling SystemManager")
+
+    cpu_usage = JSON.parse(@conn.get_cpu_usage(@secret))
+    Djinn.log_debug("CPU usage: #{cpu_usage}")
+
+    disk_usage = JSON.parse(@conn.get_disk_usage(@secret))
+    Djinn.log_debug("Disk usage: #{disk_usage}")
+
+    memory_usage = JSON.parse(@conn.get_memory_usage(@secret))
+    Djinn.log_debug("Memory usage: #{memory_usage}")
+
+    service_summary = JSON.parse(@conn.get_service_summary(@secret))
+    Djinn.log_debug("Service summary: #{service_summary}")
+
+    swap_usage = JSON.parse(@conn.get_swap_usage(@secret))
+    Djinn.log_debug("Swap usage: #{swap_usage}")
+
+    all_stats = cpu_usage
+    all_stats = all_stats.merge(disk_usage)
+    all_stats = all_stats.merge(memory_usage)
+    all_stats = all_stats.merge(swap_usage)
+
+    # Service summary is a flat dictionary, while the rest contain nested
+    # dictionaries.
+    all_stats["services"] = service_summary
+
+    return all_stats
   end
 
 

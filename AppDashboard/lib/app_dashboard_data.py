@@ -21,24 +21,12 @@ class DashboardDataRoot(ndb.Model):
       implement support for the Datastore API (e.g., hypertable, cassandra).
     replication: An int that corresponds to the number of replicas present for
       each piece of data in the underlying datastore.
+    timestamp: A timestamp of when this entity was created.
   """
   head_node_ip = ndb.StringProperty()
   table = ndb.StringProperty()
   replication = ndb.IntegerProperty()
-
-
-class ApiStatus(ndb.Model):
-  """ A Datastore Model that contains information about the current state of an
-  Google App Engine API that AppScale provides support for.
-
-  Fields:
-    id: A str that corresponds to the name of the Google App Engine API. This
-      field isn't explicitly defined because all ndb.Models have a str id
-      that uniquely identifies them in the Datastore.
-    status: A str that indicates what the current status of the API is (e.g.,
-      running, failed, unknown).
-  """
-  status = ndb.StringProperty()
+  timestamp = ndb.DateTimeProperty(auto_now=True, auto_now_add=True)
 
 
 class ServerStatus(ndb.Model):
@@ -54,11 +42,13 @@ class ServerStatus(ndb.Model):
     disk: The percent of hard disk space in use on this machine.
     roles: A list of strs, where each str corresponds to a service that this
       machine runs.
+    timestamp: A timestamp of when this entity was created.
   """
   cpu = ndb.StringProperty()
   memory = ndb.StringProperty()
   disk = ndb.StringProperty()
   roles = ndb.StringProperty(repeated=True)
+  timestamp = ndb.DateTimeProperty(auto_now=True, auto_now_add=True)
 
 
 class RequestInfo(ndb.Model):
@@ -67,14 +57,14 @@ class RequestInfo(ndb.Model):
 
   Fields:
     app_id: A string, the application identifier.
-    timestamp: The date and time when the AppController took the measurement
-      of how many requests access haproxy for an App Engine app.
     num_of_requests: The average number of requests per second that reached
       haproxy for a Google App Engine application.
+    timestamp: The date and time when the AppController took the measurement
+      of how many requests access haproxy for an App Engine app.
   """
   app_id = ndb.StringProperty(required=True)
-  timestamp = ndb.DateTimeProperty()
   num_of_requests = ndb.FloatProperty()
+  timestamp = ndb.DateTimeProperty()
 
 
 class AppStatus(ndb.Model):
@@ -85,9 +75,11 @@ class AppStatus(ndb.Model):
     name: The application ID associated with this Google App Engine app.
     url: A URL that points to an nginx server, which serves a full proxy to
       this Google App Engine app.
+    timestamp: A timestamp of when this entity was created.
   """
   name = ndb.StringProperty()
-  url = ndb.StringProperty()
+  url = ndb.StringProperty(repeated=True)
+  timestamp = ndb.DateTimeProperty(auto_now=True, auto_now_add=True)
 
 
 class UserInfo(ndb.Model):
@@ -106,10 +98,12 @@ class UserInfo(ndb.Model):
       interface.
     owned_apps: A list of strs, where each str represents an application ID
       that the user has administrative rights on.
+    timestamp: A timestamp of when this entity was created.
   """
   is_user_cloud_admin = ndb.BooleanProperty()
   can_upload_apps = ndb.BooleanProperty()
   owned_apps = ndb.StringProperty(repeated=True)
+  timestamp = ndb.DateTimeProperty(auto_now=True, auto_now_add=True)
 
 
 class InstanceInfo(ndb.Model):
@@ -128,12 +122,13 @@ class InstanceInfo(ndb.Model):
       browser.
     language: A str that indicates if this instance is running a Python, Java,
       Go, or PHP App Engine application.
+    timestamp: A timestamp of when this entity was created.
   """
   appid = ndb.StringProperty()
   host = ndb.StringProperty()
   port = ndb.IntegerProperty()
   language = ndb.StringProperty()
-
+  timestamp = ndb.DateTimeProperty(auto_now=True, auto_now_add=True)
 
 class AppDashboardData():
   """ AppDashboardData leverages ndb (which itself utilizes Memcache and the
@@ -217,7 +212,6 @@ class AppDashboardData():
     """
     self.update_head_node_ip()
     self.update_database_info()
-    self.update_api_status()
     self.update_status_info()
     self.update_application_info()
     self.update_users()
@@ -298,43 +292,6 @@ class AppDashboardData():
     except Exception as err:
       logging.exception(err)
       return None
-
-
-  def get_api_status(self):
-    """ Retrieves the current status of Google App Engine APIs in this AppScale
-    deployment from the Datastore.
-
-    Returns:
-      A dict, where each key is the name of an API (a str), and each value
-      indicates if the API is running, has failed, or is in an unknown state
-      (also a str).
-    """
-    return dict((api.key.id(), api.status) for api in self.get_all(ApiStatus))
-
-
-  def update_api_status(self):
-    """ Updates the Datastore with the newest information about the health of
-    the Google App Engine APIs available in this AppScale deployment, by
-    contacting the AppController. """
-    try:
-      acc = self.helper.get_appcontroller_client()
-      updated_status = acc.get_api_status()
-      updated_datastore_entries = []
-      for api_name, api_status in updated_status.iteritems():
-        store = self.get_by_id(ApiStatus, api_name)
-        if store and store.status != api_status:
-          store.status = api_status
-          updated_datastore_entries.append(store)
-        elif not store:
-          store = ApiStatus(id = api_name, status = api_status)
-          updated_datastore_entries.append(store)
-        else:
-          # There has been no update.
-          pass
-      if updated_datastore_entries:
-        ndb.put_multi(updated_datastore_entries)
-    except Exception as err:
-      logging.exception(err)
 
 
   def get_status_info(self):
@@ -517,8 +474,11 @@ class AppDashboardData():
             continue
           if done_loading:
             try:
-              app_names_and_urls[app] = "http://{0}:{1}".format(
-                self.helper.get_login_host(), self.helper.get_app_port(app))
+              host_url = self.helper.get_login_host()
+              ports = self.helper.get_app_ports(app)
+              app_names_and_urls[app] = [
+                  "http://{0}:{1}".format(host_url, ports[0]),
+                  "https://{0}:{1}".format(host_url, ports[1])]
             except AppHelperException:
               app_names_and_urls[app] = None
           else:

@@ -4,9 +4,10 @@ require 'djinn'
 # The location on the local filesystem where we should store ZooKeeper data.
 DATA_LOCATION = "/opt/appscale/zookeeper"
 
-
 ZOOKEEPER_PORT="2181"
 
+# The path in ZooKeeper where the deployment ID is stored.
+DEPLOYMENT_ID_PATH = '/appscale/deployment_id'
 
 def configure_zookeeper(nodes, my_index)
   # TODO: create multi node configuration
@@ -20,6 +21,10 @@ leaderServes=yes
 maxClientsCnxns=0
 forceSync=no
 skipACL=yes
+autopurge.snapRetainCount=5
+# Increased zookeeper activity can produce a vast amount of logs/snapshots.
+# With this we ensure that logs/snapshots are cleaned up hourly.
+autopurge.purgeInterval=1
 EOF
   myid = ""
 
@@ -51,45 +56,54 @@ EOF
   Djinn.log_run("sed -i s/^JAVA_OPTS=.*/JAVA_OPTS=\"-Xmx1024m\"/ /etc/zookeeper/conf/environment")
 end
 
-def start_zookeeper
-  Djinn.log_info("starting ZooKeeper")
-  if @options['clear_datastore']
+def start_zookeeper(clear_datastore)
+  if clear_datastore
     Djinn.log_run("rm -rfv /var/lib/zookeeper")
     Djinn.log_run("rm -rfv #{DATA_LOCATION}")
   end
 
+  # Detect which version of zookeeper script we have.
+  zk_server="zookeeper-server"
+  if system("service --status-all|grep zookeeper$")
+    zk_server="zookeeper"
+  end
+
   if !File.directory?("#{DATA_LOCATION}")
-    Djinn.log_info("Initializing ZooKeeper")
+    Djinn.log_info("Initializing ZooKeeper.")
+    # Let's stop zookeeper in case it is still running.
+    system("/usr/sbin/service #{zk_server} stop")
+
+    # Let's create the new location for zookeeper.
     Djinn.log_run("mkdir -pv #{DATA_LOCATION}")
     Djinn.log_run("chown -Rv zookeeper:zookeeper #{DATA_LOCATION}")
-    Djinn.log_run("/usr/sbin/service zookeeper-server init")
-    Djinn.log_run("chown -Rv zookeeper:zookeeper #{DATA_LOCATION}")
+
+    # Only precise (and zookeeper-server) has an init function.
+    if zk_server == "zookeeper-server"
+      if not system("/usr/sbin/service #{zk_server} init")
+        Djinn.log_error("Failed to start zookeeper!")
+        raise Exception FailedZooKeeperOperationException.new("Failed to" +
+          " start zookeeper!")
+      end
+    end
   end
 
   # myid is needed for multi node configuration.
   Djinn.log_run("ln -sfv /etc/zookeeper/conf/myid #{DATA_LOCATION}/myid")
 
-  start_cmd = "/usr/sbin/service zookeeper-server start"
-  stop_cmd = "/usr/sbin/service zookeeper-server stop"
+  start_cmd = "/usr/sbin/service #{zk_server} start"
+  stop_cmd = "/usr/sbin/service #{zk_server} stop"
   match_cmd = "org.apache.zookeeper.server.quorum.QuorumPeerMain"
-  MonitInterface.start(:zookeeper, start_cmd, stop_cmd, ports=9999, env_vars=nil,
-    remote_ip=nil, remote_key=nil, match_cmd=match_cmd)
-  Djinn.log_info("Started ZooKeeper")
+  MonitInterface.start(:zookeeper, start_cmd, stop_cmd, ports=ZOOKEEPER_PORT, env_vars=nil,
+    match_cmd=match_cmd)
+end
+
+def is_zookeeper_running?
+  output = MonitInterface.is_running?(:zookeeper)
+  Djinn.log_debug("Checking if zookeeper is already monitored: #{output}")
+  return output
 end
 
 def stop_zookeeper
   Djinn.log_info("Stopping ZooKeeper")
   MonitInterface.stop(:zookeeper)
 end
-
-# This method returns ZooKeeper connection string like:
-# server1:2181,server2:2181
-
-def get_zk_connection_string(nodes)
-  zlist = []
-  nodes.each { |node|
-    zlist.push("#{node.private_ip}:#{ZOOKEEPER_PORT}") if node.is_zookeeper?
-  }
-  return zlist.join(",")
-end
-
