@@ -5,12 +5,6 @@ require 'helperfunctions'
 require 'monit_interface'
 
 
-# A Fixnum that indicates which port the Thrift service binds to, by default.
-# Note that this class does not dictate what port it binds to - change this
-# constant and the template file that dictates to change this port.
-THRIFT_PORT = 9160
-
-
 # A String that indicates where we write the process ID that Cassandra runs
 # on at this machine.
 PID_FILE = "/var/appscale/appscale-cassandra.pid"
@@ -27,6 +21,18 @@ CASSANDRA_EXECUTABLE = "#{CASSANDRA_DIR}/cassandra/bin/cassandra"
 
 # A directory containing Cassandra-related scripts and libraries.
 CASSANDRA_ENV_DIR = "#{APPSCALE_HOME}/AppDB/cassandra_env"
+
+
+# The location of the script that sets up Cassandra's config files.
+SETUP_CONFIG_SCRIPT = "#{APPSCALE_HOME}/scripts/setup_cassandra_config_files.py"
+
+
+# The location of the nodetool binary.
+NODETOOL = "#{CASSANDRA_DIR}/cassandra/bin/nodetool"
+
+
+# The location of the script that creates the initial tables.
+PRIME_SCRIPT = "#{CASSANDRA_ENV_DIR}/prime_cassandra.py"
 
 
 # Determines if a UserAppServer should run on this machine.
@@ -79,28 +85,13 @@ end
 #   slave_ips: An Array of Strings, where each String corresponds to a private
 #     FQDN or IP address of a machine hosting a Database Slave role.
 #   replication: The desired level of replication.
-def setup_db_config_files(master_ip, slave_ips, replication)
-  source_dir = "#{CASSANDRA_ENV_DIR}/templates"
-  dest_dir = "#{CASSANDRA_DIR}/cassandra/conf"
-
+def setup_db_config_files(master_ip, slave_ips)
   local_token = get_local_token(master_ip, slave_ips)
-
-  files_to_config = Djinn.log_run("ls #{source_dir}").split
-  files_to_config.each{ |filename|
-    full_path_to_read = File.join(source_dir, filename)
-    full_path_to_write = File.join(dest_dir, filename)
-    File.open(full_path_to_read) { |source_file|
-      contents = source_file.read
-      contents.gsub!(/APPSCALE-LOCAL/, HelperFunctions.local_ip)
-      contents.gsub!(/APPSCALE-MASTER/, master_ip)
-      contents.gsub!(/APPSCALE-TOKEN/, "#{local_token}")
-      contents.gsub!(/REPLICATION/, "#{replication}")
-      contents.gsub!(/APPSCALE-JMX-PORT/, "7070")              
-      File.open(full_path_to_write, "w+") { |dest_file|
-        dest_file.write(contents)
-      }
-    }
-  }
+  local_ip = HelperFunctions.local_ip
+  setup_script = "#{SETUP_CONFIG_SCRIPT} --local-ip #{local_ip} "\
+                 "--master-ip #{master_ip}"
+  setup_script << " --local-token #{local_token}" unless local_token.nil?
+  Djinn.log_run(setup_script)
 end
 
 
@@ -109,10 +100,10 @@ end
 #
 # Args:
 #   clear_datastore: Remove any pre-existent data in the database.
-def start_db_master(clear_datastore)
+def start_db_master(clear_datastore, replication)
   @state = "Starting up Cassandra on the head node"
   Djinn.log_info("Starting up Cassandra as master")
-  start_cassandra(clear_datastore)
+  start_cassandra(clear_datastore, replication)
 end
 
 
@@ -122,13 +113,12 @@ end
 #
 # Args:
 #   clear_datastore: Remove any pre-existent data in the database.
-def start_db_slave(clear_datastore)
+def start_db_slave(clear_datastore, replication)
   @state = "Waiting for Cassandra to come up"
   Djinn.log_info("Starting up Cassandra as slave")
-
-  HelperFunctions.sleep_until_port_is_open(Djinn.get_db_master_ip, THRIFT_PORT)
-  Kernel.sleep(5)
-  start_cassandra(clear_datastore)
+  start_cassandra(clear_datastore, replication)
+  Djinn.log_info('Ensuring necessary Cassandra tables are present')
+  sleep(1) until system("#{PRIME_SCRIPT} --check")
 end
 
 
@@ -136,7 +126,7 @@ end
 #
 # Args:
 #   clear_datastore: Remove any pre-existent data in the database.
-def start_cassandra(clear_datastore)
+def start_cassandra(clear_datastore, replication)
   Djinn.log_run("pkill ThriftBroker")
   if clear_datastore
     Djinn.log_info("Erasing datastore contents")
@@ -150,8 +140,19 @@ def start_cassandra(clear_datastore)
   match_cmd = "/opt/cassandra"
   MonitInterface.start(:cassandra, start_cmd, stop_cmd, ports=9999, env_vars=nil,
     match_cmd=match_cmd)
-  HelperFunctions.sleep_until_port_is_open(HelperFunctions.local_ip,
-    THRIFT_PORT)
+
+  # Ensure enough Cassandra nodes are available.
+  sleep(1) until system("#{NODETOOL} status")
+  while true
+    output = `"#{NODETOOL}" status`
+    nodes_ready = 0
+    output.split("\n").each{ |line|
+      nodes_ready += 1 if line.start_with?('UN')
+    }
+    Djinn.log_debug("#{nodes_ready} nodes are up. #{replication} are needed.")
+    break if nodes_ready >= replication
+    sleep(1)
+  end
 end
 
 # Kills Cassandra on this machine.

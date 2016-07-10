@@ -11,12 +11,12 @@ if [ -z "$APPSCALE_HOME_RUNTIME" ]; then
     export APPSCALE_HOME_RUNTIME=/opt/appscale
 fi
 
-if [ -z "$APPSCALE_PACKAGE_MIRROR" ]; then
+if [ -z "${APPSCALE_PACKAGE_MIRROR-}" ]; then
     export APPSCALE_PACKAGE_MIRROR=http://s3.amazonaws.com/appscale-build
 fi
 
 export UNAME_MACHINE=$(uname -m)
-if [ -z "$JAVA_HOME_DIRECTORY" ]; then
+if [ -z "${JAVA_HOME_DIRECTORY-}" ]; then
     if [ "$UNAME_MACHINE" = "x86_64" ]; then
         export JAVA_HOME_DIRECTORY=/usr/lib/jvm/java-7-openjdk-amd64
     elif [ "$UNAME_MACHINE" = "armv7l" ] || [ "$UNAME_MACHINE" = "armv6l" ]; then
@@ -223,13 +223,6 @@ EOF
     chmod +x $LOGROTATE_HOURLY
 }
 
-installthrift()
-{
-    case ${DIST} in
-        precise|wheezy) pipwrapper thrift ;;
-    esac
-}
-
 installjavajdk()
 {
     # This makes jdk-7 the default JVM.
@@ -238,20 +231,19 @@ installjavajdk()
 
 installappserverjava()
 {
+    JAVA_SDK_DIR="${APPSCALE_HOME}/AppServer_Java"
+
     JAVA_SDK_PACKAGE="appengine-java-sdk-1.8.4.zip"
     JAVA_SDK_PACKAGE_MD5="f5750b0c836870a3089096fd537a1272"
     cachepackage ${JAVA_SDK_PACKAGE} ${JAVA_SDK_PACKAGE_MD5}
-    unzip "${PACKAGE_CACHE}/${JAVA_SDK_PACKAGE}" \
-      -d ${APPSCALE_HOME}/AppServer_Java
+    unzip "${PACKAGE_CACHE}/${JAVA_SDK_PACKAGE}" -d ${JAVA_SDK_DIR}
 
     # Compile source file.
-    cd ${APPSCALE_HOME}/AppServer_Java
-    ant install
-    ant clean-build
+    (cd ${JAVA_SDK_DIR} && ant install && ant clean-build)
 
     if [ -n "$DESTDIR" ]; then
         # Delete unnecessary files.
-        rm -rfv src lib
+        rm -rf ${JAVA_SDK_DIR}/src ${JAVA_SDK_DIR}/lib
     fi
 }
 
@@ -286,7 +278,7 @@ installgems()
     # ZK 1.0 breaks our existing code - upgrade later.
     gem install zookeeper
     sleep 1
-    gem install json ${GEMOPT}
+    gem install json ${GEMOPT} -v 1.8.3
     sleep 1
     gem install soap4r-ruby1.9 ${GEMOPT}
     gem install httparty ${GEMOPT}
@@ -330,7 +322,6 @@ installsolr()
 installcassandra()
 {
     CASSANDRA_VER=2.0.7
-    PYCASSA_VER=1.9.1
 
     CASSANDRA_PACKAGE="apache-cassandra-${CASSANDRA_VER}-bin.tar.gz"
     CASSANDRA_PACKAGE_MD5="1894c5103d12a2be14a2c44bfa2363cc"
@@ -347,23 +338,13 @@ installcassandra()
     mv -v ${CASSANDRA_DIR}/apache-cassandra-${CASSANDRA_VER} ${CASSANDRA_DIR}/cassandra
 
     chmod -v +x ${CASSANDRA_DIR}/cassandra/bin/cassandra
-    cp -v ${CASSANDRA_ENV}/templates/cassandra.in.sh\
-        ${CASSANDRA_DIR}/cassandra/bin
     cp -v ${CASSANDRA_ENV}/templates/cassandra-env.sh\
         ${CASSANDRA_DIR}/cassandra/conf
     mkdir -p /var/lib/cassandra
     # TODO only grant the cassandra user access.
     chmod 777 /var/lib/cassandra
 
-    if [ "$DIST" = "precise" ]; then
-        pipwrapper  thrift
-    fi
-    pipwrapper  pycassa
-
-    JAMM_PACKAGE="jamm-0.2.2.jar"
-    JAMM_PACKAGE_MD5="07829fab6b45af032e061b5708cfbb3b"
-    cachepackage ${JAMM_PACKAGE} ${JAMM_PACKAGE_MD5}
-    cp "${PACKAGE_CACHE}/${JAMM_PACKAGE}" ${CASSANDRA_DIR}/cassandra/lib
+    pipwrapper cassandra-driver
 
     # Create separate log directory.
     mkdir -pv /var/log/appscale/cassandra

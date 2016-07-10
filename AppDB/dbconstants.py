@@ -33,6 +33,8 @@ APP_ID_TABLE = "APP_IDS__"
 APP_ENTITY_TABLE = "ENTITIES__"
 APP_KIND_TABLE = "KINDS__"
 METADATA_TABLE = "METADATA__"
+DATASTORE_METADATA_TABLE = "DATASTORE_METADATA__"
+SCHEMA_TABLE = '__key__'
 
 INITIAL_TABLES = [ASC_PROPERTY_TABLE,
                   DSC_PROPERTY_TABLE,
@@ -41,7 +43,10 @@ INITIAL_TABLES = [ASC_PROPERTY_TABLE,
                   APP_KIND_TABLE,
                   COMPOSITE_TABLE,
                   JOURNAL_TABLE,
-                  METADATA_TABLE]
+                  METADATA_TABLE,
+                  USERS_TABLE,
+                  APPS_TABLE,
+                  SCHEMA_TABLE]
 
 ###########################################
 # DB schemas for version 1 of the datastore
@@ -109,6 +114,12 @@ APPS_SCHEMA = [
   "tar_ball",
   "enabled",
   "indexes" ]
+
+DATASTORE_METADATA_SCHEMA = [
+  "version"]
+
+# All schema information for the keyspace is stored in the schema table.
+SCHEMA_TABLE_SCHEMA = ['schema']
 
 ###############################
 # Generic Datastore Exceptions
