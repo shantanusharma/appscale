@@ -281,7 +281,7 @@ installgems()
     gem install json ${GEMOPT} -v 1.8.3
     sleep 1
     gem install soap4r-ruby1.9 ${GEMOPT}
-    gem install httparty ${GEMOPT}
+    gem install httparty ${GEMOPT} -v 0.13.7
     gem install httpclient ${GEMOPT}
     # This is for the unit testing framework.
     gem install simplecov ${GEMOPT}
@@ -321,10 +321,10 @@ installsolr()
 
 installcassandra()
 {
-    CASSANDRA_VER=2.0.7
+    CASSANDRA_VER=2.1.15
 
     CASSANDRA_PACKAGE="apache-cassandra-${CASSANDRA_VER}-bin.tar.gz"
-    CASSANDRA_PACKAGE_MD5="1894c5103d12a2be14a2c44bfa2363cc"
+    CASSANDRA_PACKAGE_MD5="3ef581936b5a1d3bc2f2f189e6530ced"
     cachepackage ${CASSANDRA_PACKAGE} ${CASSANDRA_PACKAGE_MD5}
 
     # Remove old Cassandra environment directory.

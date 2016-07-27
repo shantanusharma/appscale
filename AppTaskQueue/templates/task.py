@@ -47,34 +47,30 @@ def QUEUE_NAME(headers, args):
       # We do this check because the expires attribute in
       # celery is not passed to retried tasks. This is a
       # documented bug in celery.
-
+      logger.error("Task %s with id %s has expired with expiration date %s" % (
+                   args['task_name'], QUEUE_NAME.request.id, args['expires']))
       item = TaskName.get_by_key_name(args['task_name'])
-      item.state = TASK_STATES.EXPIRED
-      item.endtime = datetime.datetime.now()
-      item.put()
-      logger.error("Task %s with id %s has expired with expiration date %s" % \
-                   (args['task_name'], QUEUE_NAME.request.id, args['expires']))
       celery.control.revoke(QUEUE_NAME.request.id)
+      db.delete(item)
       return
 
     if QUEUE_NAME.request.retries >= args['max_retries'] and \
-           args['max_retries'] != 0:
-      logger.error("Task %s with id %s has exceeded retries: %s" % \
-                   (args['task_name'], QUEUE_NAME.request.id, args['max_retries']))
-
+        args['max_retries'] != 0:
+      logger.error("Task %s with id %s has exceeded retries: %s" % (
+                   args['task_name'], QUEUE_NAME.request.id,
+                   args['max_retries']))
       item = TaskName.get_by_key_name(args['task_name'])
-      item.state = TASK_STATES.FAILED
-      item.endtime = datetime.datetime.now()
-      item.put()
       celery.control.revoke(QUEUE_NAME.request.id)
+      db.delete(item)
       return
 
     if url.scheme == 'http':
-      connection = httplib.HTTPConnection(url.hostname, url.port)
+      connection = httplib.HTTPConnection(PUBLIC_IP, url.port)
     elif url.scheme == 'https':
-      connection = httplib.HTTPSConnection(url.hostname, url.port)
+      connection = httplib.HTTPSConnection(PUBLIC_IP, url.port)
     else:
-      logger.error("Task %s tried to use url scheme %s, which is not supported." % (args['task_name'], url.scheme))
+      logger.error("Task %s tried to use url scheme %s, "
+                   "which is not supported." % (args['task_name'], url.scheme))
 
     skip_host = False
     if 'host' in headers or 'Host' in headers:
@@ -102,7 +98,8 @@ def QUEUE_NAME(headers, args):
       if url.query:
         connection.putheader('content-type', 'application/octet-stream')
       else:
-        connection.putheader('content-type', 'application/x-www-form-urlencoded')
+        connection.putheader('content-type',
+                             'application/x-www-form-urlencoded')
 
     connection.putheader("Content-Length", content_length)
     connection.endheaders()
@@ -113,15 +110,14 @@ def QUEUE_NAME(headers, args):
     response.close()
     retries = int(QUEUE_NAME.request.retries) + 1
     if 200 <= response.status < 300:
-      # Mark the task as a success.
+      # Task successful.
       item = TaskName.get_by_key_name(args['task_name'])
-      item.state = TASK_STATES.SUCCESS
-      item.endtime = datetime.datetime.now()
-      item.put()
+      db.delete(item)
       return response.status
     elif response.status == 302:
       redirect_url = response.getheader('Location')
-      logger.info("Task %s asked us to redirect to %s, so retrying there." % (args['task_name'], redirect_url))
+      logger.info("Task %s asked us to redirect to %s, so retrying there." % (
+        args['task_name'], redirect_url))
       url = urlparse(redirect_url)
       if redirects_left == 0:
         raise QUEUE_NAME.retry(countdown=get_wait_time(retries, args))
@@ -130,6 +126,10 @@ def QUEUE_NAME(headers, args):
       # Fail
       # TODO: Update the database with the failed status
       wait_time = get_wait_time(retries, args)
-      logger.warning("Task %s will retry in %d seconds. Got response of %d when doing a %s on %s" % \
-                      (args['task_name'], wait_time, response.status, method, args['url']))
+      logger.warning("Task %s will retry in %d seconds. "
+                     "Got response of %d when doing a %s on %s" % \
+                      (args['task_name'],
+                      wait_time,
+                      response.status,
+                      method, args['url']))
       raise QUEUE_NAME.retry(countdown=wait_time)

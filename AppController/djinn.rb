@@ -1536,7 +1536,9 @@ class Djinn
     app_name.gsub!(/[^\w\d\-]/, "")
     Djinn.log_info("Shutting down app named [#{app_name}]")
     result = ""
-    Djinn.log_run("rm -rf #{HelperFunctions.get_app_path(app_name)}")
+    # Prevent future deploys from using the old application code.
+    FileUtils.rm_rf("#{HelperFunctions.get_app_path(app_name)}")
+    FileUtils.rm_rf("#{PERSISTENT_MOUNT_POINT}/apps/#{app_name}.tar.gz")
     CronHelper.clear_app_crontab(app_name)
 
     # app shutdown process can take more than 30 seconds
@@ -3607,27 +3609,40 @@ class Djinn
       threads << Thread.new {
         Djinn.log_info("Starting database services.")
         clear_datastore = @options['clear_datastore'].downcase == "true"
-        replication = Integer(@options['replication'])
+        db_nodes = @nodes.count{|node| node.is_db_master? or node.is_db_slave?}
+        needed_nodes = needed_for_quorum(db_nodes,
+                                         Integer(@options['replication']))
         if my_node.is_db_master?
-          start_db_master(clear_datastore, replication)
+          start_db_master(clear_datastore, needed_nodes)
           prime_database
         else
-          start_db_slave(clear_datastore, replication)
+          start_db_slave(clear_datastore, needed_nodes)
         end
-
-        # Always colocate the Datastore Server and UserAppServer (soap_server).
-        @state = "Starting up SOAP Server and Datastore Server"
-        start_datastore_server()
-
-        # Start the UserAppServer and wait till it's ready.
-        start_soap_server()
-        Djinn.log_info("Done starting database services.")
       }
     end
 
     # We now wait for the essential services to go up.
     Djinn.log_info("Waiting for DB services ... ")
     threads.each { |t| t.join() }
+
+    Djinn.log_info('Ensuring necessary database tables are present')
+    sleep(SMALL_WAIT) until system("#{PRIME_SCRIPT} --check")
+
+    layout_script = "#{APPSCALE_HOME}/AppDB/scripts/appscale-data-layout"
+    unless system("#{layout_script} --db-type cassandra")
+      HelperFunctions.log_and_crash(
+        'Unexpected data layout version. Please run "appscale upgrade".')
+    end
+
+    if my_node.is_db_master? or my_node.is_db_slave?
+      # Always colocate the Datastore Server and UserAppServer (soap_server).
+      @state = "Starting up SOAP Server and Datastore Server"
+      start_datastore_server()
+
+      # Start the UserAppServer and wait till it's ready.
+      start_soap_server()
+      Djinn.log_info("Done starting database services.")
+    end
 
     # All nodes wait for the UserAppServer now. The call here is just to
     # ensure the UserAppServer is talking to the persistent state.
@@ -4370,8 +4385,7 @@ HOSTS
         end
       }
 
-      Djinn.log_run("rm -rf #{PERSISTENT_MOUNT_POINT}")
-      Djinn.log_run("mkdir #{PERSISTENT_MOUNT_POINT}")
+      Djinn.log_run("mkdir -p #{PERSISTENT_MOUNT_POINT}")
       mount_output = Djinn.log_run("mount -t ext4 #{device_name} " +
         "#{PERSISTENT_MOUNT_POINT} 2>&1")
       if mount_output.empty?
@@ -4382,7 +4396,7 @@ HOSTS
         # Finally, RabbitMQ expects data to be present at /var/lib/rabbitmq.
         # Make sure there is data present there and that it points to our
         # persistent disk.
-        if File.exists?("#{PERSISTENT_MOUNT_POINT}/rabbitmq")
+        if File.directory?("#{PERSISTENT_MOUNT_POINT}/rabbitmq")
           Djinn.log_run("rm -rf /var/lib/rabbitmq")
         else
           Djinn.log_run("mv /var/lib/rabbitmq #{PERSISTENT_MOUNT_POINT}")
@@ -4701,7 +4715,7 @@ HOSTS
             end
           end
           @app_names = @app_names + [app]
-        rescue FailedNodeEsception
+        rescue FailedNodeException
           Djinn.log_warn("Couldn't check if app #{app} exists on #{db_private_ip}")
         end
       }
@@ -4807,7 +4821,7 @@ HOSTS
         APPS_LOCK.synchronize {
           @apps_to_restart.each { |app_name|
             Djinn.log_info("Got #{app_name} to restart (if applicable).")
-            setup_app_dir(app_name, true)
+            setup_appengine_application(app_name)
 
             app_manager = AppManagerClient.new(my_node.private_ip)
             # TODO: What happens if the user updates their env vars between app
