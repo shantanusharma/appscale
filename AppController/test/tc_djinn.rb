@@ -144,7 +144,7 @@ class TestDjinn < Test::Unit::TestCase
     assert_equal(true, result_2.include?("Error: database_credentials"))
 
     result_3 = djinn.set_parameters("", [], bad_param, @secret)
-    assert_equal(true, result_3.include?("Error: app_names"))
+    assert_equal(true, result_3.include?("Error: apps"))
 
     # Since DB credentials will be turned from an Array to a Hash,
     # it should have an even number of items in it
@@ -230,7 +230,8 @@ class TestDjinn < Test::Unit::TestCase
     djinn.nodes = [DjinnJobData.new(master_role, "appscale")]
 
     # Set the clear_datastore option.
-    djinn.options = { 'clear_datastore' => 'false' }
+    djinn.options = {'clear_datastore' => 'false',
+                     'verbose' => 'false'}
 
     # make sure we write the secret to the cookie file
     # throw in Proc as the last arg to the mock since we don't care about what
@@ -271,7 +272,8 @@ class TestDjinn < Test::Unit::TestCase
     djinn.nodes = [DjinnJobData.new(master_role, "appscale"), DjinnJobData.new(slave_role, "appscale")]
 
     # Set the clear_datastore option.
-    djinn.options = { 'clear_datastore' => 'false' }
+    djinn.options = {'clear_datastore' => 'false',
+                     'verbose' => 'false'}
 
     # make sure we write the secret to the cookie file
     # throw in Proc as the last arg to the mock since we don't care about what
@@ -718,7 +720,7 @@ class TestDjinn < Test::Unit::TestCase
     flexmock(YAML).should_receive(:load_file).with(app_yaml).
       and_return({})
 
-    nginx_conf = "/etc/nginx/sites-enabled/booapp.conf"
+    nginx_conf = "/etc/nginx/sites-enabled/appscale-booapp.conf"
     flexmock(File).should_receive(:open).with(nginx_conf, "w+", Proc).and_return()
     flexmock(Nginx).should_receive(:start).and_return()
     flexmock(Nginx).should_receive(:is_running?).and_return(true)
@@ -1092,7 +1094,7 @@ class TestDjinn < Test::Unit::TestCase
     role = {
       "public_ip" => "public_ip",
       "private_ip" => "private_ip",
-      "jobs" => ["login"],
+      "jobs" => ["login","shadow"],
       "instance_id" => "instance_id"
     }
 
@@ -1102,6 +1104,12 @@ class TestDjinn < Test::Unit::TestCase
     my_node = DjinnJobData.new(role, "appscale")
     djinn.nodes = [my_node]
     djinn.app_info_map = {
+      'myapp' => {
+        'nginx' => 8081,
+        'nginx_https' => 4381,
+        'haproxy' => 10001,
+        'appengine' => ["1.2.3.4:20001"]
+      },
       'another-app' => {
         'nginx' => 80,
         'nginx_https' => 443,
@@ -1125,7 +1133,7 @@ class TestDjinn < Test::Unit::TestCase
     role = {
       "public_ip" => "public_ip",
       "private_ip" => "private_ip",
-      "jobs" => ["login"],
+      "jobs" => ["login","shadow"],
       "instance_id" => "instance_id"
     }
 
@@ -1135,6 +1143,12 @@ class TestDjinn < Test::Unit::TestCase
     my_node = DjinnJobData.new(role, "appscale")
     djinn.nodes = [my_node]
     djinn.app_info_map = {
+      'myapp' => {
+        'nginx' => 8081,
+        'nginx_https' => 4381,
+        'haproxy' => 10001,
+        'appengine' => ["1.2.3.4:20001"]
+      },
       'another-app' => {
         'nginx' => 80,
         'nginx_https' => 443,
@@ -1158,7 +1172,7 @@ class TestDjinn < Test::Unit::TestCase
     role = {
       "public_ip" => "public_ip",
       "private_ip" => "private_ip",
-      "jobs" => ["login"],
+      "jobs" => ["login","shadow"],
       "instance_id" => "instance_id"
     }
 
@@ -1168,6 +1182,12 @@ class TestDjinn < Test::Unit::TestCase
     my_node = DjinnJobData.new(role, "appscale")
     djinn.nodes = [my_node]
     djinn.app_info_map = {
+      'myapp' => {
+        'nginx' => 8081,
+        'nginx_https' => 4381,
+        'haproxy' => 10001,
+        'appengine' => ["1.2.3.4:20001"]
+      },
       'another-app' => {
         'nginx' => 80,
         'nginx_https' => 443,
@@ -1191,7 +1211,7 @@ class TestDjinn < Test::Unit::TestCase
     role = {
       "public_ip" => "public_ip",
       "private_ip" => "private_ip",
-      "jobs" => ["login"],
+      "jobs" => ["login","shadow"],
       "instance_id" => "instance_id"
     }
 
@@ -1201,6 +1221,12 @@ class TestDjinn < Test::Unit::TestCase
     my_node = DjinnJobData.new(role, "appscale")
     djinn.nodes = [my_node]
     djinn.app_info_map = {
+      'myapp' => {
+        'nginx' => 8081,
+        'nginx_https' => 4381,
+        'haproxy' => 10001,
+        'appengine' => ["1.2.3.4:20000"]
+      },
       'another-app' => {
         'nginx' => 80,
         'nginx_https' => 443,

@@ -10,6 +10,7 @@ import os
 import sys
 import time
 
+from appscale.taskqueue.distributed_tq import create_pull_queue_tables
 from cassandra import ConsistencyLevel
 from cassandra.cluster import Cluster
 from cassandra_env.cassandra_interface import INITIAL_CONNECT_RETRIES
@@ -51,6 +52,42 @@ def define_ua_schema(session):
     session.execute(define_schema, values)
 
 
+def create_batch_tables(cluster, session):
+  """ Create the tables required for large batches.
+
+  Args:
+    cluster: A cassandra-driver cluster.
+    session: A cassandra-driver session.
+  """
+  logging.info('Trying to create batches')
+  cluster.refresh_schema_metadata()
+  create_table = """
+    CREATE TABLE IF NOT EXISTS batches (
+      app text,
+      transaction int,
+      namespace text,
+      path blob,
+      old_value blob,
+      new_value blob,
+      exclude_indices text,
+      PRIMARY KEY ((app, transaction), namespace, path)
+    )
+  """
+  session.execute(create_table)
+
+  logging.info('Trying to create batch_status')
+  cluster.refresh_schema_metadata()
+  create_table = """
+    CREATE TABLE IF NOT EXISTS batch_status (
+      app text,
+      transaction int,
+      applied boolean,
+      PRIMARY KEY ((app), transaction)
+    )
+  """
+  session.execute(create_table)
+
+
 def prime_cassandra(replication):
   """ Create Cassandra keyspace and initial tables.
 
@@ -68,12 +105,12 @@ def prime_cassandra(replication):
 
   hosts = appscale_info.get_db_ips()
 
+  cluster = None
   session = None
   remaining_retries = INITIAL_CONNECT_RETRIES
   while True:
     try:
-      # Cassandra 2.1 only supports up to Protocol Version 3.
-      cluster = Cluster(hosts, protocol_version=3)
+      cluster = Cluster(hosts)
       session = cluster.connect()
       break
     except cassandra.cluster.NoHostAvailable as connection_error:
@@ -105,7 +142,11 @@ def prime_cassandra(replication):
                column=ThriftColumn.COLUMN_NAME,
                value=ThriftColumn.VALUE)
     logging.info('Trying to create {}'.format(table))
+    cluster.refresh_schema_metadata()
     session.execute(create_table)
+
+  create_batch_tables(cluster, session)
+  create_pull_queue_tables(cluster, session)
 
   first_entity = session.execute(
     'SELECT * FROM "{}" LIMIT 1'.format(dbconstants.APP_ENTITY_TABLE))
@@ -147,7 +188,11 @@ def primed():
     db_access = cassandra_interface.DatastoreProxy()
   except cassandra.InvalidRequest:
     return False
-  return db_access.get_metadata(cassandra_interface.PRIMED_KEY) == 'true'
+
+  try:
+    return db_access.get_metadata(cassandra_interface.PRIMED_KEY) == 'true'
+  finally:
+    db_access.close()
 
 
 if __name__ == "__main__":

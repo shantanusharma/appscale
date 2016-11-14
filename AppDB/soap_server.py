@@ -241,11 +241,12 @@ def does_user_exist(username, secret):
   global super_secret
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(USER_TABLE, username, ["email"])
+  try:
+    result = db.get_entity(USER_TABLE, username, ["email"])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
   if result[0] in ERROR_CODES and len(result) == 2:
     return "true"
-  elif 'Exception' in result[0]:
-    return result[0]
   else:
     return "false"
 
@@ -254,7 +255,10 @@ def does_app_exist(appname, secret):
   global super_secret
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(APP_TABLE, appname, ["name"])
+  try:
+    result = db.get_entity(APP_TABLE, appname, ["name"])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
   if result[0] in ERROR_CODES and len(result) == 2:
     return "true"
   else:
@@ -265,7 +269,10 @@ def get_user_apps(username, secret):
   global super_secret
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(USER_TABLE, username, ["applications"])
+  try:
+    result = db.get_entity(USER_TABLE, username, ["applications"])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
   if result[0] in ERROR_CODES and len(result) == 2:
     return result[1]
   else:
@@ -278,7 +285,10 @@ def get_user_data(username, secret):
   global user_schema
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(USER_TABLE, username, user_schema)
+  try:
+    result = db.get_entity(USER_TABLE, username, user_schema)
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
 
   if result[0] in ERROR_CODES or len(result) == 1:
     result = result[1:]
@@ -300,7 +310,10 @@ def get_app_data(appname, secret):
   if not appname or  not secret:
     return "Error: Null appname"
 
-  result = db.get_entity(APP_TABLE, appname, app_schema)
+  try:
+    result = db.get_entity(APP_TABLE, appname, app_schema)
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
 
   if result[0] not in ERROR_CODES or len(result) == 1:
     return "Error: " + result[0]
@@ -356,7 +369,11 @@ def add_admin_for_app(user, app, secret):
   if secret != super_secret:
     return "Error: bad secret"
 
-  user_result = db.get_entity(USER_TABLE, user, user_schema)
+  try:
+    user_result = db.get_entity(USER_TABLE, user, user_schema)
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if user_result[0] not in ERROR_CODES or len(user_result) <= 1:
     return user_result
 
@@ -395,7 +412,11 @@ def commit_new_app(appname, user, language, secret):
 
   ret = "true"
 
-  user_result = db.get_entity(USER_TABLE, user, user_schema)
+  try:
+    user_result = db.get_entity(USER_TABLE, user, user_schema)
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if user_result[0] in ERROR_CODES and len(user_result) > 1:
     user_result = user_result[1:]
     n_user = Users("a", "b", "c")
@@ -428,7 +449,11 @@ def get_tar(app_name, secret):
   global super_secret
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(APP_TABLE, app_name, ["tar_ball"])
+  try:
+    result = db.get_entity(APP_TABLE, app_name, ["tar_ball"])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] in ERROR_CODES and len(result) == 2:
     return result[1]
   else:
@@ -447,7 +472,11 @@ def commit_tar(app_name, tar, secret):
 
 
   columns = ["tar_ball", "version", "last_time_updated_date", "enabled"]
-  result = db.get_entity(APP_TABLE, app_name, columns)
+  try:
+    result = db.get_entity(APP_TABLE, app_name, columns)
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] in ERROR_CODES and len(result) > 1:
     result = result[1:]
     values = []
@@ -465,34 +494,6 @@ def commit_tar(app_name, tar, secret):
     error = "Error: unable to get app %s" % result[0]
     return error
   return "true"
-
-def delete_all_users(secret):
-  global db
-  global super_secret
-  global user_schema
-  users = []
-  if secret != super_secret:
-    return "Error: bad secret"
-
-  result = db.get_table(USER_TABLE, user_schema)
-  if result[0] not in ERROR_CODES:
-    return "false"
-
-  result = result[1:]
-  for ii in range(0, (len(result)/len(user_schema))):
-    partial = result[(ii * len(user_schema)): ((1 + ii) * len(user_schema))]
-    if len(partial) != len(user_schema):
-      pass
-    else:
-      u = Users("x", "x", "user")
-      u.unpackit(partial)
-      users.append(u)
-  ret = "true"
-  for ii in u:
-    result = db.delete_row(USER_TABLE, ii.email_)
-    if result[0] not in ERROR_CODES:
-      ret = "false"
-  return ret
 
 def delete_all_apps(secret):
   global db
@@ -573,7 +574,11 @@ def add_instance(appname, host, port, https_port, secret):
     return "Error: bad secret"
 
   columns = ["host", "port"]
-  result = db.get_entity(APP_TABLE, appname, columns)
+  try:
+    result = db.get_entity(APP_TABLE, appname, columns)
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   error = result[0]
   if error not in ERROR_CODES or len(columns) != (len(result) - 1):
     return "false"
@@ -591,7 +596,11 @@ def delete_app(appname, secret):
   if secret != super_secret:
     return "Error: bad secret"
 
-  result = db.get_entity(APP_TABLE, appname, ["owner"])
+  try:
+    result = db.get_entity(APP_TABLE, appname, ["owner"])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) == 1:
     return "false: unable to get entity for app"
 
@@ -611,7 +620,12 @@ def delete_instance(appname, host, port, secret):
     return "Error: bad secret"
 
   ret = "true"
-  result = db.get_entity(APP_TABLE, appname, ['host', 'port'])
+
+  try:
+    result = db.get_entity(APP_TABLE, appname, ['host', 'port'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   error = result[0]
   if error not in ERROR_CODES or len(result) == 1:
     return "false"
@@ -645,7 +659,12 @@ def commit_new_token(user, token, token_exp, secret):
   if secret != super_secret:
     return "Error: bad secret"
   columns = ['appdrop_rem_token', 'appdrop_rem_token_exp']
-  result = db.get_entity(USER_TABLE, user, columns)
+
+  try:
+    result = db.get_entity(USER_TABLE, user, columns)
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) == 1:
     return "Error: User does not exist"
 
@@ -669,7 +688,12 @@ def get_token(user, secret):
   if secret != super_secret:
     return "Error: bad secret"
   columns = ['appdrop_rem_token', 'appdrop_rem_token_exp']
-  result = db.get_entity(USER_TABLE, user, columns)
+
+  try:
+    result = db.get_entity(USER_TABLE, user, columns)
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) == 1:
     return "false"
   result = result[1:]
@@ -681,7 +705,12 @@ def get_version(appname, secret):
   if secret != super_secret:
     return "Error: bad secret"
   columns = ['version']
-  result = db.get_entity(APP_TABLE, appname, columns)
+
+  try:
+    result = db.get_entity(APP_TABLE, appname, columns)
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) == 1:
     return "false"
   result = result[1:]
@@ -698,7 +727,11 @@ def change_password(user, password, secret):
   if not password:
     return "Error: Null password"
 
-  result = db.get_entity(USER_TABLE, user, ['enabled'])
+  try:
+    result = db.get_entity(USER_TABLE, user, ['enabled'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) == 1:
     return "Error: user does not exist"
 
@@ -717,7 +750,11 @@ def enable_app(appname, secret):
   if secret != super_secret:
     return "Error: bad secret"
 
-  result = db.get_entity(APP_TABLE, appname, ['enabled'])
+  try:
+    result = db.get_entity(APP_TABLE, appname, ['enabled'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) != 2:
     return "Error: " + result[0]
   if result[1] == "true":
@@ -735,7 +772,12 @@ def disable_app(appname, secret):
   global app_schema
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(APP_TABLE, appname, ['enabled'])
+
+  try:
+    result = db.get_entity(APP_TABLE, appname, ['enabled'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) != 2:
     return "Error: " + result[0]
   if result[1] == "false":
@@ -751,7 +793,12 @@ def is_app_enabled(appname, secret):
   global app_schema
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(APP_TABLE, appname, ['enabled'])
+
+  try:
+    result = db.get_entity(APP_TABLE, appname, ['enabled'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) != 2:
     return "false"
   return result[1]
@@ -762,7 +809,12 @@ def enable_user(user, secret):
   global user_schema
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(USER_TABLE, user, ['enabled'])
+
+  try:
+    result = db.get_entity(USER_TABLE, user, ['enabled'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) != 2:
     return "Error: " + result[0]
   if result[1] == "true":
@@ -779,7 +831,12 @@ def disable_user(user, secret):
   global super_secret
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(USER_TABLE, user, ['enabled'])
+
+  try:
+    result = db.get_entity(USER_TABLE, user, ['enabled'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) != 2:
     return "Error: " + result[0]
   if result[1] == "false":
@@ -796,7 +853,12 @@ def delete_user(user, secret):
   global super_secret
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(USER_TABLE, user, ['enabled'])
+
+  try:
+    result = db.get_entity(USER_TABLE, user, ['enabled'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) != 2:
     return "false"
 
@@ -814,7 +876,12 @@ def is_user_enabled(user, secret):
   global user_schema
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(USER_TABLE, user, ['enabled'])
+
+  try:
+    result = db.get_entity(USER_TABLE, user, ['enabled'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) == 1:
     return "false"
   return result[1]
@@ -825,7 +892,12 @@ def get_key_block(app_id, block_size, secret):
   global app_schema
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(APP_TABLE, app_id, ['num_entries'])
+
+  try:
+    result = db.get_entity(APP_TABLE, app_id, ['num_entries'])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] not in ERROR_CODES or len(result) == 1:
     return "false"
   key = result[1]
@@ -843,7 +915,12 @@ def is_user_cloud_admin(username, secret):
   global super_secret
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(USER_TABLE, username, ["is_cloud_admin"])
+
+  try:
+    result = db.get_entity(USER_TABLE, username, ["is_cloud_admin"])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] in ERROR_CODES and len(result) == 2:
     return result[1]
   else:
@@ -864,7 +941,12 @@ def get_capabilities(username, secret):
   global super_secret
   if secret != super_secret:
     return "Error: bad secret"
-  result = db.get_entity(USER_TABLE, username, ["capabilities"])
+
+  try:
+    result = db.get_entity(USER_TABLE, username, ["capabilities"])
+  except AppScaleDBConnectionError as db_error:
+    return 'Error: {}'.format(db_error)
+
   if result[0] in ERROR_CODES and len(result) == 2:
     return result[1]
   else:
@@ -915,14 +997,24 @@ if __name__ == "__main__":
   # Keep trying until it gets the schema.
   timeout = 5
   while 1:
-    user_schema = db.get_schema(USER_TABLE)
+    try:
+      user_schema = db.get_schema(USER_TABLE)
+    except AppScaleDBConnectionError as db_error:
+      time.sleep(timeout)
+      continue
+
     if user_schema[0] in ERROR_CODES:
       user_schema = user_schema[1:]
       Users.attributes_ = user_schema
     else:
       time.sleep(timeout)
       continue
-    app_schema = db.get_schema(APP_TABLE)
+    try:
+      app_schema = db.get_schema(APP_TABLE)
+    except AppScaleDBConnectionError as db_error:
+      time.sleep(timeout)
+      continue
+
     if app_schema[0] in ERROR_CODES:
       app_schema = app_schema[1:]
       Apps.attributes_ = app_schema
@@ -957,7 +1049,6 @@ if __name__ == "__main__":
   server.registerFunction(commit_tar)
   server.registerFunction(commit_new_token)
   server.registerFunction(delete_instance)
-  server.registerFunction(delete_all_users)
   server.registerFunction(delete_all_apps)
   server.registerFunction(delete_user)
   server.registerFunction(delete_app)

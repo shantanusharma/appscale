@@ -200,8 +200,9 @@ def restore_data(path, keyname, force=False):
     retries = SERVICE_STOP_RETRIES
     while status != MonitStates.UNMONITORED:
       utils.ssh(db_ip, keyname,
-        'monit stop {}'.format(CASSANDRA_MONIT_WATCH_NAME))
-      time.sleep(1)
+                'monit stop {}'.format(CASSANDRA_MONIT_WATCH_NAME),
+                method=subprocess.call)
+      time.sleep(3)
       summary = utils.ssh(db_ip, keyname, 'monit summary',
         method=subprocess.check_output)
       status = utils.monit_status(summary, CASSANDRA_MONIT_WATCH_NAME)
@@ -218,6 +219,7 @@ def restore_data(path, keyname, force=False):
 
     if db_ip not in machines_without_restore:
       utils.ssh(db_ip, keyname, 'tar xf {} -C {}'.format(path, cassandra_dir))
+      utils.ssh(db_ip, keyname, 'chown -R cassandra {}'.format(cassandra_dir))
 
     utils.ssh(db_ip, keyname,
       'monit start {}'.format(CASSANDRA_MONIT_WATCH_NAME))

@@ -3,6 +3,13 @@ This file contains constants used throughout AppScale.
 """
 import os
 
+
+class HTTPCodes(object):
+  BAD_REQUEST = 400
+  FORBIDDEN = 403
+  NOT_FOUND = 404
+  NOT_IMPLEMENTED = 501
+
 # AppScale home directory.
 APPSCALE_HOME = os.environ.get("APPSCALE_HOME", "/root/appscale")
 
@@ -49,7 +56,7 @@ DB_SERVER_PORT = 8888
 UA_SERVER_PORT = 4343
 
 # The port of the application manager soap server.
-APP_MANAGER_PORT = 49934
+APP_MANAGER_PORT = 17445
 
 # Python programs.
 PYTHON = "python"
@@ -98,3 +105,9 @@ CONTROLLER_SERVICE = 'appscale-controller'
 
 # The default log directory for AppScale services.
 LOG_DIR = os.path.join('/var', 'log', 'appscale')
+
+# The number of seconds to wait before retrying some operations.
+SMALL_WAIT = 5
+
+# The number of seconds to wait before retrying some operations.
+TINY_WAIT = .1

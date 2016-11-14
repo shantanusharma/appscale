@@ -6,6 +6,7 @@ require 'monitor'
 require 'net/http'
 require 'net/https'
 require 'openssl'
+require 'securerandom'
 require 'socket'
 require 'soap/rpc/driver'
 require 'syslog'
@@ -49,27 +50,23 @@ require "zookeeper_helper"
 
 NO_OUTPUT = false
 
+
 # This lock makes it so that global variables related to apps are not updated
 # concurrently, preventing race conditions.
 APPS_LOCK = Monitor.new()
+
 
 # This lock is to ensure that only one thread is trying to start/stop
 # applications.
 AMS_LOCK = Mutex.new()
 
-# A HTTP client that assumes that responses returned are JSON, and automatically
-# loads them, returning the result. Raises a NoMethodError if the host/URL is
-# down or otherwise unreachable.
-class JSONClient
-  include HTTParty
 
-  # Assume the response is JSON and load it accordingly.
-  parser(
-    Proc.new do |body, format|
-      JSON.load(body)
-    end
-  )
-end
+# Prevents nodetool from being invoked concurrently.
+NODETOOL_LOCK = Mutex.new()
+
+
+# The name of the user to be used with reserved applications.
+APPSCALE_USER = "appscale-user@local.appscale"
 
 
 # The string that should be returned to the caller if they call a publicly
@@ -112,6 +109,10 @@ LOGROTATE_DIR = '/etc/logrotate.d'
 
 # The name of the generic appscale centralized app logrotate script.
 APPSCALE_APP_LOGROTATE = 'appscale-app-logrotate.conf'
+
+
+# The location of the appscale-upload-app script from appscale-tools.
+UPLOAD_APP_SCRIPT = '/usr/local/bin/appscale-upload-app'
 
 
 # Djinn (interchangeably known as 'the AppController') automatically
@@ -429,6 +430,10 @@ class Djinn
   KEY_NOT_FOUND = "No property exists with the given name."
 
 
+  # A String indicating when we are looking for a Zookeeper connection to
+  # become available.
+  NO_ZOOKEEPER_CONNECTION = "No Zookeeper available: in isolated mode"
+
   # Where to put logs.
   LOG_FILE = "/var/log/appscale/controller-17443.log"
 
@@ -476,7 +481,14 @@ class Djinn
     'use_spot_instances' => [ TrueClass, nil ],
     'user_commands' => [ String, nil ],
     'verbose' => [ TrueClass, 'False' ],
-    'zone' => [ String, nil ]
+    'zone' => [ String, nil ],
+    'azure_subscription_id' => [ String, nil ],
+    'azure_app_id' => [ String, nil ],
+    'azure_app_secret_key' => [ String, nil ],
+    'azure_tenant_id' => [ String, nil ],
+    'azure_resource_group' => [ String, nil ],
+    'azure_storage_account' => [ String, nil ],
+    'azure_group_tag' => [ String, nil ]
   }
 
   # Template used for rsyslog configuration files.
@@ -571,9 +583,7 @@ class Djinn
   # A SOAP-exposed method that callers can use to get information about what
   # roles each node in the AppScale deployment are running.
   def get_role_info(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     all_nodes = []
     @nodes.each { |node|
@@ -595,9 +605,7 @@ class Djinn
   #   can be authenticated, a JSON-dumped Hash containing information about
   #   applications on this machine is returned.
   def get_app_info_map(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     return JSON.dump(@app_info_map)
   end
@@ -619,75 +627,70 @@ class Djinn
   #   "OK" if the relocation occurred successfully, and a String containing the
   #   reason why the relocation failed in all other cases.
   def relocate_app(appid, http_port, https_port, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
+    return BAD_SECRET_MSG unless valid_secret?(secret)
+    Djinn.log_debug("Received relocate_app for #{appid} for " +
+        "http port #{http_port} and https port #{https_port}.")
+
+    unless my_node.is_shadow?
+      # We need to send the call to the shadow.
+      Djinn.log_debug("Sending relocate_app for #{appid} to #{get_shadow}.")
+      acc = AppControllerClient.new(get_shadow.private_ip, @@secret)
+      begin
+        return acc.relocate_app(appid, http_port, https_port)
+      rescue FailedNodeException
+        Djinn.log_warn("Failed to forward relocate_app call to #{get_shadow}.")
+        return NOT_READY
+      end
     end
 
-    # Only the login node runs relocate.
-    if not my_node.is_login?
-      Djinn.log_warn("Only login nodes runs relocate.")
-      return "Error: this is not the login node."
+    # Sanity checks on app ID and settings.
+    return "Error: Can't relocate the #{appid} app." if RESERVED_APPS.include?(appid)
+    begin
+      http_port = Integer(http_port)
+      https_port = Integer(https_port)
+    rescue ArgumentError
+      Djinn.log_warn("relocate_app received invalid port values.")
+      return INVALID_REQUEST
     end
-
-    Djinn.log_debug("@app_info_map is #{@app_info_map.inspect}")
-    http_port = Integer(http_port)
-    https_port = Integer(https_port)
-
-    # First, only let users relocate apps to ports that the firewall has open
-    # for App Engine apps.
-    if http_port != 80 and
-       (http_port < Nginx::START_PORT or http_port > Nginx::END_PORT)
-      return "Error: HTTP port must be 80, or in the range" +
-        " #{Nginx::START_PORT}-#{Nginx::END_PORT}."
-    end
-
-    if (https_port < Nginx::START_PORT - Nginx::SSL_PORT_OFFSET or https_port >
-        Nginx::END_PORT - Nginx::SSL_PORT_OFFSET) and https_port != 443
-      return "Error: HTTPS port must be 443, or in the range " +
-         "#{Nginx::START_PORT - Nginx::SSL_PORT_OFFSET}-" +
-         "#{Nginx::END_PORT - Nginx::SSL_PORT_OFFSET}."
-    end
-
-    # We need to check if http_port and https_port are already in use by
-    # another application, so we do that with find_lowest_free_port and we
-    # fix the range to the single port.
-    if find_lowest_free_port(http_port, http_port, appid) < 0
-      return "Error: requested http port is already in use."
-    end
-    if find_lowest_free_port(https_port, https_port, appid) < 0
-      return "Error: requested https port is already in use."
-    end
-
-    if RESERVED_APPS.include?(appid)
-      return "Error: Can't relocate the #{appid} app."
-    end
-
-    # Next, rewrite the nginx config file with the new ports
-    Djinn.log_info("Regenerating nginx config for relocated app #{appid}")
     APPS_LOCK.synchronize {
+      if @app_info_map[appid].nil? or @app_info_map[appid]['nginx'].nil? or
+          @app_info_map[appid]['nginx_https'].nil? or
+          @app_info_map[appid]['haproxy'].nil?
+        Djinn.log_warn("Unable to relocate due to missing app settings for: #{appid}.")
+        return INVALID_REQUEST
+      end
+
+      # First, only let users relocate apps to ports that the firewall has open
+      # for App Engine apps.
+      if http_port != 80 and
+         (http_port < Nginx::START_PORT or http_port > Nginx::END_PORT)
+        return "Error: HTTP port must be 80, or in the range" +
+          " #{Nginx::START_PORT}-#{Nginx::END_PORT}."
+      end
+
+      if (https_port < Nginx::START_PORT - Nginx::SSL_PORT_OFFSET or https_port >
+          Nginx::END_PORT - Nginx::SSL_PORT_OFFSET) and https_port != 443
+        return "Error: HTTPS port must be 443, or in the range " +
+           "#{Nginx::START_PORT - Nginx::SSL_PORT_OFFSET}-" +
+           "#{Nginx::END_PORT - Nginx::SSL_PORT_OFFSET}."
+      end
+
+      # We need to check if http_port and https_port are already in use by
+      # another application, so we do that with find_lowest_free_port and we
+      # fix the range to the single port.
+      if find_lowest_free_port(http_port, http_port, appid) < 0
+        return "Error: requested http port is already in use."
+      end
+      if find_lowest_free_port(https_port, https_port, appid) < 0
+        return "Error: requested https port is already in use."
+      end
+
+      # Next, rewrite the nginx config file with the new ports
       @app_info_map[appid]['nginx'] = http_port
       @app_info_map[appid]['nginx_https'] = https_port
     }
-    proxy_port = @app_info_map[appid]['haproxy']
-    my_private = my_node.private_ip
+    Djinn.log_info("Assigned ports for relocated app #{appid}.")
     my_public = my_node.public_ip
-    login_ip = get_login.private_ip
-
-    static_handlers = HelperFunctions.parse_static_data(appid)
-    Nginx.write_fullproxy_app_config(appid, http_port, https_port, my_public,
-      my_private, proxy_port, static_handlers, login_ip,
-      @app_info_map[appid]['language'])
-
-    Djinn.log_debug("Done writing new nginx config files!")
-    Nginx.reload()
-
-    # Same for any cron jobs the user has set up.
-    # TODO: We do this on the login node, but the cron jobs are initially
-    # set up on the shadow node. In all supported cases, these are the same
-    # node, but there may be an issue if they are on different nodes in
-    # the future.
-    CronHelper.update_cron(my_public, http_port,
-      @app_info_map[appid]['language'], appid)
 
     # Finally, the AppServer takes in the port to send Task Queue tasks to
     # from a file. Update the file and restart the AppServers so they see
@@ -699,7 +702,7 @@ class Djinn
       # Notify the UAServer about the new ports.
       uac = UserAppClient.new(my_node.private_ip, @@secret)
       success = uac.add_instance(appid, my_public, http_port, https_port)
-      if !success
+      unless success
         Djinn.log_warn("Failed to store relocation ports for #{appid} via the uaserver.")
         return
       end
@@ -709,7 +712,7 @@ class Djinn
           HelperFunctions.scp_file(port_file, port_file, node.private_ip,
             node.ssh_key)
         end
-        next if not node.is_appengine?
+        next unless node.is_appengine?
         app_manager = AppManagerClient.new(node.private_ip)
         begin
           app_manager.restart_app_instances_for_app(appid,
@@ -739,14 +742,18 @@ class Djinn
   #   A String indicating that the termination has started, or the reason why it
   #   failed.
   def kill(stop_deployment, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
+    begin
+      return BAD_SECRET_MSG unless valid_secret?(secret)
+    rescue Errno::ENOENT
+      # On appscale down, terminate may delete our secret key before we
+      # can check it here.
+      Djinn.log_debug("kill(): didn't find secret file. Continuing.")
     end
     @kill_sig_received = true
 
     Djinn.log_info("Received a stop request.")
 
-    if my_node.is_login? and stop_deployment
+    if my_node.is_shadow? and stop_deployment
       Djinn.log_info("Stopping all other nodes.")
       # Let's stop all other nodes.
       threads << Thread.new {
@@ -776,10 +783,8 @@ class Djinn
   # Validates and sets the instance variables that Djinn needs before it can
   # begin configuring and deploying services on a given node (and if it is the
   # first Djinn, starting up the other Djinns).
-  def set_parameters(djinn_locations, database_credentials, app_names, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+  def set_parameters(djinn_locations, database_credentials, apps, secret)
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     if djinn_locations.class != String
       msg = "Error: djinn_locations wasn't a String, but was a " +
@@ -796,9 +801,8 @@ class Djinn
       return msg
     end
 
-    if app_names.class != Array
-      msg = "Error: app_names wasn't an Array, but was a " +
-        app_names.class.to_s
+    if apps.class != Array
+      msg = "Error: apps wasn't an Array, but was a " + apps.class.to_s
       Djinn.log_error(msg)
       return msg
     end
@@ -807,7 +811,7 @@ class Djinn
     # hash tables, so we need to make sure that every key maps to a value
     # e.g., ['foo', 'bar'] becomes {'foo' => 'bar'}
     # so we need to make sure that the array has an even number of elements
-    if database_credentials.length % 2 != 0
+    if database_credentials.length.odd?
       msg = "Error: DB Credentials wasn't of even length: Len = " + \
         "#{database_credentials.length}"
       Djinn.log_error(msg)
@@ -815,13 +819,13 @@ class Djinn
     end
 
     possible_credentials = Hash[*database_credentials]
-    if !valid_format_for_credentials(possible_credentials)
+    unless valid_format_for_credentials(possible_credentials)
       return "Error: Credential format wrong"
     end
 
     keyname = possible_credentials["keyname"]
     @options = possible_credentials
-    @app_names = app_names
+    @app_names = apps
 
     nodes = Djinn.convert_location_array_to_class(locations, keyname)
     converted_nodes = convert_fqdns_to_ips(nodes)
@@ -850,7 +854,7 @@ class Djinn
       # the parameter. There is no boolean, so TrueClass and FalseClass
       # needs to be check both. If not, remove the parameter since we
       # won't be able to translate it.
-      if not (val.class == String or val.class == PARAMETERS_AND_CLASS[key][0] or
+      unless (val.class == String or val.class == PARAMETERS_AND_CLASS[key][0] or
          (PARAMETERS_AND_CLASS[key][0] == TrueClass and val.class == FalseClass))
         begin
           msg = "Removing parameter '" + key + "' with unknown value '" +\
@@ -869,7 +873,7 @@ class Djinn
       # Let's check if we can convert them now to the proper class.
       if PARAMETERS_AND_CLASS[key][0] == Fixnum
         begin
-          test_value = Integer(val)
+          Integer(val)
         rescue
           msg = "Warning: parameter '" + key + "' is not an integer (" +\
             val.to_s + "). Removing it."
@@ -901,7 +905,7 @@ class Djinn
 
     # Now let's make sure the parameters that needs to have values are
     # indeed defines, otherwise set the defaults.
-    PARAMETERS_AND_CLASS.each { |key, key_type, val|
+    PARAMETERS_AND_CLASS.each { |key, _class, _val|
       if @options[key]
         # The parameter 'key' is defined, no need to do anything.
         next
@@ -913,13 +917,28 @@ class Djinn
       end
     }
 
-    find_me_in_locations()
-    if @my_index.nil?
-      return "Error: Couldn't find me in the node map"
+    # From here on we do more logical checks on the values we received.
+    # The first one is to check that max and min are set appropriately.
+    # Max and min needs to be at least the number of started nodes, it
+    # needs to be positive. Max needs to be no smaller than min.
+    if Integer(@options['max_images']) < @nodes.length
+      Djinn.log_warn("max_images is less than the number of nodes!")
+      @options['max_images'] = @nodes.length.to_s
+    end
+    if Integer(@options['min_images']) < @nodes.length
+      Djinn.log_warn("min_images is less than the number of nodes!")
+      @options['min_images'] = @nodes.length.to_s
+    end
+    if Integer(@options['max_images']) < Integer(@options['min_images'])
+      Djinn.log_warn("min_images is bigger than max_images!")
+      @options['max_images'] = @options['min_images']
     end
 
-    ENV['EC2_URL'] = @options['ec2_url']
+    # We need to make sure this node is listed in the started nodes.
+    find_me_in_locations()
+    return "Error: Couldn't find me in the node map" if @my_index.nil?
 
+    ENV['EC2_URL'] = @options['ec2_url']
     if @options['ec2_access_key'].nil?
       @options['ec2_access_key'] = @options['EC2_ACCESS_KEY']
       @options['ec2_secret_key'] = @options['EC2_SECRET_KEY']
@@ -955,9 +974,7 @@ class Djinn
   #   A string with the current node's status
   #
   def status(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     stats = get_stats(secret)
 
@@ -970,30 +987,32 @@ class Djinn
     Current State: #{stats['state']}
     STATUS
 
-    if my_node.is_login?
-      app_names = []
-      stats['apps'].each { |k, v|
-        app_names << k
+    if my_node.is_shadow?
+      apps = []
+      stats['apps'].each { |key, _|
+        apps << key
       }
 
-      stats_str << "    Hosting the following apps: #{app_names.join(', ')}\n"
+      stats_str << "    Hosting the following apps: #{apps.join(', ')}\n"
 
       stats['apps'].each { |app_name, is_loaded|
-        next if !is_loaded
+        next unless is_loaded
         next if app_name == "none"
         stats_str << "    Information for application: #{app_name}\n"
         stats_str << "        Language            : "
-        if !@app_info_map[app_name]['language'].nil?
-          stats_str << "#{@app_info_map[app_name]['language']}\n"
-        else
+        if @app_info_map[app_name]['language'].nil?
           stats_str << "Unknown\n"
+        else
+          stats_str << "#{@app_info_map[app_name]['language']}\n"
         end
         stats_str << "        Number of AppServers: "
-        if !@app_info_map[app_name]['appengine'].nil?
+        if @app_info_map[app_name]['appengine'].nil?
+          stats_str << "Unknown\n"
+        else
           running = 0
           pending = 0
           @app_info_map[app_name]['appengine'].each{ |location|
-             host, port = location.split(":")
+             _host, port = location.split(":")
              if Integer(port) > 0
                running += 1
              else
@@ -1005,20 +1024,18 @@ class Djinn
             stats_str << ", #{pending} pending"
           end
           stats_str << "\n"
-        else
-          stats_str << "Unknown\n"
         end
         stats_str << "        HTTP port           : "
-        if !@app_info_map[app_name]['nginx'].nil?
-          stats_str << "#{@app_info_map[app_name]['nginx']}\n"
-        else
+        if @app_info_map[app_name]['nginx'].nil?
           stats_str << "Unknown\n"
+        else
+          stats_str << "#{@app_info_map[app_name]['nginx']}\n"
         end
         stats_str << "        HTTPS port          : "
-        if !@app_info_map[app_name]['nginx_https'].nil?
-          stats_str << "#{@app_info_map[app_name]['nginx_https']}\n"
-        else
+        if @app_info_map[app_name]['nginx_https'].nil?
           stats_str << "Unknown\n"
+        else
+          stats_str << "#{@app_info_map[app_name]['nginx_https']}\n"
         end
       }
     end
@@ -1039,28 +1056,44 @@ class Djinn
   #   successfully, and a reservation ID that can be used with
   #   get_app_upload_status to see if the app has successfully uploaded or not.
   def upload_app(archived_file, file_suffix, email, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
+    return BAD_SECRET_MSG unless valid_secret?(secret)
+
+    unless my_node.is_shadow?
+      Djinn.log_debug("Sending upload_app call to shadow.")
+      acc = AppControllerClient.new(get_shadow.private_ip, @@secret)
+      begin
+        remote_file = [archived_file, file_suffix].join('.')
+        HelperFunctions.scp_file(archived_file, remote_file,
+                                 get_shadow.private_ip, get_shadow.ssh_key)
+        return acc.upload_app(remote_file, file_suffix, email)
+      rescue FailedNodeException => except
+        Djinn.log_warn("Failed to forward upload_app call to shadow (#{get_shadow}).")
+        return NOT_READY
+      end
     end
 
     reservation_id = HelperFunctions.get_random_alphanumeric()
     @app_upload_reservations[reservation_id] = {'status' => 'starting'}
 
-    Djinn.log_debug("Received a request to upload app at #{archived_file}, with suffix #{file_suffix}, with admin user #{email}.")
+    Djinn.log_debug(
+      "Received a request to upload app at #{archived_file}, with suffix " +
+      "#{file_suffix}, with admin user #{email}.")
 
     Thread.new {
-      if !archived_file.match(/#{file_suffix}$/)
-        archived_file_old = archived_file
-        archived_file = "#{archived_file_old}.#{file_suffix}"
-        Djinn.log_debug("Renaming #{archived_file_old} to #{archived_file}")
-        File.rename(archived_file_old, archived_file)
+      # If the dashboard is on the same node as the shadow, the archive needs
+      # to be copied to a location that includes the suffix.
+      unless archived_file.match(/#{file_suffix}$/)
+        new_location = [archived_file, file_suffix].join('.')
+        Djinn.log_debug("Copying #{archived_file} to #{new_location}")
+        FileUtils.copy(archived_file, new_location)
+        archived_file = new_location
       end
 
       Djinn.log_debug("Uploading file at location #{archived_file}")
       keyname = @options['keyname']
-      command = "appscale-upload-app --file '#{archived_file}' " +
+      command = "#{UPLOAD_APP_SCRIPT} --file '#{archived_file}' " +
         "--email #{email} --keyname #{keyname} 2>&1"
-      output = Djinn.log_run("#{command}")
+      output = Djinn.log_run(command)
       if output.include?("Your app can be reached at the following URL")
         result = "true"
       else
@@ -1068,6 +1101,7 @@ class Djinn
       end
 
       @app_upload_reservations[reservation_id]['status'] = result
+      File.delete(archived_file)
     }
 
     return JSON.dump({
@@ -1089,11 +1123,22 @@ class Djinn
   #   caller attempts to authenticate with an invalid secret, BAD_SECRET_MSG is
   #   returned.
   def get_app_upload_status(reservation_id, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
+    return BAD_SECRET_MSG unless valid_secret?(secret)
+
+    unless my_node.is_shadow?
+      Djinn.log_debug("Sending get_upload_status call to shadow.")
+      acc = AppControllerClient.new(get_shadow.private_ip, @@secret)
+      begin
+        return acc.get_app_upload_status(reservation_id)
+      rescue FailedNodeException
+        Djinn.log_warn(
+          "Failed to forward get_app_upload_status call to #{get_shadow}.")
+        return NOT_READY
+      end
     end
 
-    if @app_upload_reservations[reservation_id]['status']
+    if @app_upload_reservations.has_key?(reservation_id) &&
+       @app_upload_reservations[reservation_id]['status']
       return @app_upload_reservations[reservation_id]['status']
     else
       return ID_NOT_FOUND
@@ -1107,8 +1152,18 @@ class Djinn
   # Returns:
   #   A JSON string with the statistics of the nodes.
   def get_stats_json(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
+    return BAD_SECRET_MSG unless valid_secret?(secret)
+
+    unless my_node.is_shadow?
+      Djinn.log_debug("Sending get_stats_json call to shadow.")
+      acc = AppControllerClient.new(get_shadow.private_ip, @@secret)
+      begin
+        return acc.get_stats_json()
+      rescue FailedNodeException
+        Djinn.log_warn(
+          "Failed to forward get_stats_json call to #{get_shadow}.")
+        return NOT_READY
+      end
     end
 
     return JSON.dump(@all_stats)
@@ -1147,6 +1202,8 @@ class Djinn
   # Returns:
   #   A JSON string with the database information.
   def get_database_information(secret)
+    return BAD_SECRET_MSG unless valid_secret?(secret)
+
     tree = { :table => @options['table'], :replication => @options['replication'],
       :keyname => @options['keyname'] }
     return JSON.dump(tree)
@@ -1159,9 +1216,7 @@ class Djinn
   # Returns:
   #   A Hash with the statistics of this node.
   def get_stats(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     usage = HelperFunctions.get_usage()
     mem = sprintf("%3.2f", usage['mem'])
@@ -1194,6 +1249,7 @@ class Djinn
 
     stats['apps'] = {}
     @app_names.each { |name|
+      next if RESERVED_APPS.include?(name)
       stats['apps'][name] = @apps_loaded.include?(name)
     }
     return stats
@@ -1210,9 +1266,7 @@ class Djinn
   #   'OK' if the groomer was invoked, and BAD_SECRET_MSG if the user failed to
   #   authenticate correctly.
   def run_groomer(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     Thread.new {
       run_groomer_command = "#{PYTHON27} #{APPSCALE_HOME}/AppDB/groomer.py"
@@ -1242,9 +1296,7 @@ class Djinn
   #   A JSON-dumped Hash mapping each instance variable matching the given regex
   #   to the value it is bound to.
   def get_property(property_regex, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     properties = {}
     instance_variables.each { |name|
@@ -1255,6 +1307,7 @@ class Djinn
           properties[name_without_at_sign] = value
         end
       rescue RegexpError
+        Djinn.log_warn("get_property: got invalid regex (#{property_regex}).")
       end
     }
 
@@ -1278,9 +1331,7 @@ class Djinn
   #     - KEY_NOT_FOUND if there is no instance variable with the given name.
   #     - BAD_SECRET_MSG if the caller could not be authenticated.
   def set_property(property_name, property_value, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     Djinn.log_info("Attempting to set @#{property_name} to #{property_value}")
 
@@ -1300,9 +1351,7 @@ class Djinn
   # Returns:
   #   A boolean indicating whether the deployment ID has been set or not.
   def deployment_id_exists(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     return ZKInterface.exists?(DEPLOYMENT_ID_PATH)
   end
@@ -1311,9 +1360,7 @@ class Djinn
   # Returns:
   #   A string that contains the deployment ID.
   def get_deployment_id(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     begin
       return ZKInterface.get(DEPLOYMENT_ID_PATH)
@@ -1328,9 +1375,7 @@ class Djinn
   # Args:
   #   id: A string that contains the deployment ID.
   def set_deployment_id(secret, id)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     begin
       ZKInterface.set(DEPLOYMENT_ID_PATH, id, false)
@@ -1346,9 +1391,7 @@ class Djinn
   #   read_only: A string that indicates whether to turn read-only mode on or
   #     off.
   def set_node_read_only(read_only, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
     return INVALID_REQUEST unless %w(true false).include?(read_only)
     read_only = read_only == 'true'
 
@@ -1367,9 +1410,7 @@ class Djinn
   #   read_only: A string that indicates whether to turn read-only mode on or
   #     off.
   def set_read_only(read_only, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
     return INVALID_REQUEST unless %w(true false).include?(read_only)
 
     @nodes.each { | node |
@@ -1383,6 +1424,41 @@ class Djinn
     return 'OK'
   end
 
+  # Checks if the primary database node is ready. For Cassandra, this is needed
+  # because the seed node needs to start before the other nodes.
+  # Args:
+  #   secret: A string that authenticates the caller.
+  # Returns:
+  #   A string indicating whether or not the primary database node is ready.
+  def primary_db_is_up(secret)
+    return BAD_SECRET_MSG unless valid_secret?(secret)
+
+    primary_ip = get_db_master.private_ip
+    unless my_node.is_db_master?
+      Djinn.log_debug("Asking #{primary_ip} if database is ready.")
+      acc = AppControllerClient.new(get_db_master.private_ip, @@secret)
+      begin
+        return acc.primary_db_is_up()
+      rescue FailedNodeException
+        Djinn.log_warn("Unable to ask #{primary_ip} if database is ready.")
+        return NOT_READY
+      end
+    end
+
+    lock_obtained = NODETOOL_LOCK.try_lock
+    begin
+      return NOT_READY unless lock_obtained
+      output = `"#{NODETOOL}" status`
+      ready = false
+      output.split("\n").each{ |line|
+        ready = true if line.start_with?('UN') && line.include?(primary_ip)
+      }
+      return "#{ready}"
+    ensure
+      NODETOOL_LOCK.unlock
+    end
+  end
+
   # Queries the UserAppServer to see if the named application exists,
   # and if it is listening to any port.
   #
@@ -1391,9 +1467,7 @@ class Djinn
   # Returns:
   #   A boolean indicating whether or not the user application exists.
   def does_app_exist(appname, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     begin
       uac = UserAppClient.new(my_node.private_ip, @@secret)
@@ -1410,9 +1484,7 @@ class Djinn
   #   username: The email address for the user whose password will be changed.
   #   password: The SHA1-hashed password that will be set as the user's password.
   def reset_password(username, password, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     begin
       uac = UserAppClient.new(my_node.private_ip, @@secret)
@@ -1428,9 +1500,7 @@ class Djinn
   # Args:
   #   username: The email address registered as username for the user's application.
   def does_user_exist(username, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     begin
       uac = UserAppClient.new(my_node.private_ip, @@secret)
@@ -1449,15 +1519,13 @@ class Djinn
   #   account_type: A str that indicates if this account can be logged into
   #     by XMPP users.
   def create_user(username, password, account_type, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     begin
       uac = UserAppClient.new(my_node.private_ip, @@secret)
       return uac.commit_new_user(username, password, account_type)
     rescue FailedNodeException
-      Djinn.log_warn("Failed to talk to the UserAppServer while commiting " +
+      Djinn.log_warn("Failed to talk to the UserAppServer while committing " +
         "the user #{username}.")
     end
   end
@@ -1467,9 +1535,7 @@ class Djinn
   # Args:
   #   username: The e-mail address that should be given administrative authorizations.
   def set_admin_role(username, is_cloud_admin, capabilities, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     begin
       uac = UserAppClient.new(my_node.private_ip, @@secret)
@@ -1487,9 +1553,7 @@ class Djinn
   #  Returns:
   #    A JSON-encoded string containing the application metadata.
   def get_app_data(app_id, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     begin
       uac = UserAppClient.new(my_node.private_ip, @@secret)
@@ -1509,9 +1573,7 @@ class Djinn
   #   app_language: The runtime (Python 2.5/2.7, Java, or Go) that the app
   #     runs over.
   def reserve_app_id(username, app_id, app_language, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     begin
       uac = UserAppClient.new(my_node.private_ip, @@secret)
@@ -1529,112 +1591,55 @@ class Djinn
   #   secret: Shared key for authentication
   #
   def stop_app(app_name, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
+    return BAD_SECRET_MSG unless valid_secret?(secret)
+
+    unless my_node.is_shadow?
+      Djinn.log_debug("Sending stop_app call for #{app_name} to shadow.")
+      acc = AppControllerClient.new(get_shadow.private_ip, @@secret)
+      begin
+        return acc.stop_app(app_name)
+      rescue FailedNodeException => except
+        Djinn.log_warn("Failed to forward stop_app call to shadow (#{get_shadow}).")
+        return NOT_READY
+      end
     end
 
     app_name.gsub!(/[^\w\d\-]/, "")
+    return "false: #{app_name} is a reserved app." if RESERVED_APPS.include?(app_name)
     Djinn.log_info("Shutting down app named [#{app_name}]")
     result = ""
-    # Prevent future deploys from using the old application code.
-    FileUtils.rm_rf("#{HelperFunctions.get_app_path(app_name)}")
-    FileUtils.rm_rf("#{PERSISTENT_MOUNT_POINT}/apps/#{app_name}.tar.gz")
-    CronHelper.clear_app_crontab(app_name)
 
-    # app shutdown process can take more than 30 seconds
-    # so run it in a new thread to avoid 'execution expired'
-    # error messages and have the tools poll it
+    # Since stopping an application can take some time, we do it in a
+    # thread.
     Thread.new {
-      # The login node has extra stuff to do: remove the xmpp listener and
-      # inform the other nodes to stop the application, and remove the
-      # application from the metadata (soap_server).
-      if my_node.is_login?
-        begin
-          uac = UserAppClient.new(my_node.private_ip, @@secret)
-          if not uac.does_app_exist?(app_name)
-            Djinn.log_info("(stop_app) #{app_name} does not exist.")
-          else
-            result = uac.delete_app(app_name)
-            Djinn.log_debug("(stop_app) delete_app returned: #{result}.")
-          end
-        rescue FailedNodeException
-          Djinn.log_warn("(stop_app) delete_app: failed to talk " +
-            "to the UserAppServer.")
+      begin
+        uac = UserAppClient.new(my_node.private_ip, @@secret)
+        if not uac.does_app_exist?(app_name)
+          Djinn.log_info("(stop_app) #{app_name} does not exist.")
+        else
+          result = uac.delete_app(app_name)
+          Djinn.log_debug("(stop_app) delete_app returned: #{result}.")
         end
-        @nodes.each { |node|
-          next if node.private_ip == my_node.private_ip
-          if node.is_appengine?
-            ip = node.private_ip
-            acc = AppControllerClient.new(ip, @@secret)
-            begin
-              result = acc.stop_app(app_name)
-              Djinn.log_debug("Removing application #{app_name} from #{ip} " +
-                "returned #{result}")
-            rescue FailedNodeException
-              Djinn.log_warn("Could not remove application #{app_name} from " +
-                "#{ip} - moving on to other nodes.")
-            end
-          end
-        }
-        pid_files = HelperFunctions.shell("ls #{APPSCALE_CONFIG_DIR}/xmpp-#{app_name}.pid").split
-        unless pid_files.nil? # not an error here - XMPP is optional
-          pid_files.each { |pid_file|
-            pid = HelperFunctions.read_file(pid_file)
-            Djinn.log_run("kill -9 #{pid}")
-          }
-        end
-        stop_xmpp_for_app(app_name)
+      rescue FailedNodeException
+        Djinn.log_warn("(stop_app) delete_app: failed to talk " +
+          "to the UserAppServer.")
       end
 
-      Djinn.log_debug("(stop_app) Maybe stopping taskqueue worker")
-      maybe_stop_taskqueue_worker(app_name)
-      Djinn.log_debug("(stop_app) Done maybe stopping taskqueue worker")
-
+      # If this node has any information about AppServers for this app,
+      # clear that information out.
       APPS_LOCK.synchronize {
-        if my_node.is_login?
-          Nginx.remove_app(app_name)
-          HAProxy.remove_app(app_name)
-        end
-
-        if my_node.is_appengine?
-          Djinn.log_debug("(stop_app) Calling AppManager for app #{app_name}")
-          app_manager = AppManagerClient.new(my_node.private_ip)
-          begin
-            if app_manager.stop_app(app_name)
-              Djinn.log_info("(stop_app) AppManager shut down app #{app_name}")
-            else
-              Djinn.log_error("(stop_app) unable to stop app #{app_name}")
-            end
-          rescue FailedNodeException
-            Djinn.log_warn("(stop_app) #{app_name} may have not been stopped")
-          end
-
-          begin
-            ZKInterface.remove_app_entry(app_name, my_node.public_ip)
-          rescue FailedZooKeeperOperationException => e
-            Djinn.log_warn("(stop_app) got exception talking to " +
-              "zookeeper: #{e.message}.")
-          end
-        end
-
-        # If this node has any information about AppServers for this app,
-        # clear that information out.
-        if !@app_info_map[app_name].nil?
-          @app_info_map.delete(app_name)
-        end
-
+        @app_info_map.delete(app_name) unless @app_info_map[app_name].nil?
         @apps_loaded = @apps_loaded - [app_name]
         @app_names = @app_names - [app_name]
+        @apps_loaded << "none" if @apps_loaded.empty?
+        @app_names << "none" if @app_names.empty?
+      }
 
-        if @apps_loaded.empty?
-          @apps_loaded << "none"
-        end
-
-        if @app_names.empty?
-          @app_names << "none"
-        end
-      } # end of lock
-    } # end of thread
+      # To prevent future deploys from using the old application code, we
+      # force a removal of the application status on disk (for example the
+      # code and cronjob) right now.
+      check_stopped_apps
+    }
 
     return "true"
   end
@@ -1688,41 +1693,54 @@ class Djinn
     end
   end
 
-  def update(app_names, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+  def update(apps, secret)
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     # Few sanity checks before acting.
-    if not my_node.is_login?
-      Djinn.log_warn("I'm not a login node, but received an update request.")
-      return "Error: server is not a login node."
-    end
-    if app_names.class != Array
-      return "app_names was not an Array but was a #{app_names.class}."
+    return "apps was not an Array but was a #{apps.class}." if apps.class != Array
+    unless my_node.is_shadow?
+       Djinn.log_debug("Sending update call for #{apps} to shadow.")
+       acc = AppControllerClient.new(get_shadow.private_ip, @@secret)
+       begin
+         return acc.update(apps)
+       rescue FailedNodeException => except
+         Djinn.log_warn("Failed to forward update call to shadow (#{get_shadow}).")
+         return NOT_READY
+       end
     end
 
-    Djinn.log_info("Received request to update these apps: #{app_names.join(', ')}.")
+    RESERVED_APPS.each { |reserved_app|
+      if apps.include?(reserved_app)
+        Djinn.log_warn("Cannot update reserved app #{reserved_app}.")
+        apps.delete(reserved_app)
+      end
+    }
+    Djinn.log_info("Received request to update these apps: #{apps.join(', ')}.")
 
     # Begin by marking the apps that should be running.
-    current_apps_uploaded = @apps_loaded
-    Djinn.log_debug("Running apps: #{app_names.join(', ')}.")
+    apps_to_restart = []
+    failed_apps = []
+    APPS_LOCK.synchronize {
+      # Get a list of the apps we need to restart.
+      apps_to_restart = @apps_loaded & apps
+      Djinn.log_debug("Apps to restart are #{apps_to_restart}.")
 
-    # Get a list of the apps we need to restart.
-    apps_to_restart = current_apps_uploaded & app_names
-    Djinn.log_debug("Apps to restart are #{apps_to_restart}")
-
-    # Next, check if the language of the application is correct.
-    app_names.each{ |app|
-      if check_app_language(app) == INVALID_REQUEST
-        apps_to_restart.delete(app)
-        result = stop_app(app, @@secret)
-        Djinn.log_error("Disabling app #{app} because of invalid language.")
-      end
+      # Next, check if the language of the application is correct.
+      apps.each{ |app|
+        if @app_info_map[app] && @app_info_map[app]['language'] &&
+          @app_info_map[app]['language'] != get_app_language(app)
+          failed_apps << app
+        end
+      }
+    }
+    failed_apps.each { |app|
+      apps_to_restart.delete(app)
+      stop_app(app, @@secret)
+      Djinn.log_error("Disabled #{app} since language doesn't match our record.")
     }
 
     # Next, restart any apps that have new code uploaded.
-    if !apps_to_restart.empty?
+    unless apps_to_restart.empty?
       apps_to_restart.each { |appid|
         location = "#{PERSISTENT_MOUNT_POINT}/apps/#{appid}.tar.gz"
         begin
@@ -1750,16 +1768,12 @@ class Djinn
         end
         Djinn.log_debug("Set apps to restart at #{ip} returned #{result} as class #{result.class}")
       }
-
-      if my_node.is_login?
-        regenerate_nginx_config_files()
-      end
     end
 
     APPS_LOCK.synchronize {
       # Since we have at least one application running, we don't need to
       # display anymore 'none' as the list of running applications.
-      @app_names |= app_names
+      @app_names |= apps
       @app_names = @app_names - ["none"]
     }
     Djinn.log_debug("Done updating apps!")
@@ -1778,9 +1792,7 @@ class Djinn
   #   A String indicating that the SOAP call succeeded, or the reason why it
   #   did not.
   def set_apps_to_restart(apps_to_restart, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     APPS_LOCK.synchronize {
       @apps_to_restart += apps_to_restart
@@ -1792,9 +1804,7 @@ class Djinn
   end
 
   def get_all_public_ips(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     public_ips = []
     @nodes.each { |node|
@@ -1804,9 +1814,7 @@ class Djinn
   end
 
   def job_start(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     Djinn.log_info("==== Starting AppController (pid: #{Process.pid}) ====")
 
@@ -1831,7 +1839,6 @@ class Djinn
       @zookeeper_data = zookeeper_data['locations']
       if @zookeeper_data.include?(my_ip) and !is_zookeeper_running?
         # We are a zookeeper host and we need to start it.
-        Djinn.log_info("Starting zookeeper.")
         begin
           start_zookeeper(false)
         rescue FailedZooKeeperOperationException
@@ -1848,7 +1855,14 @@ class Djinn
     # the options for this deployment. It's either a save state from a
     # previous start, or it comes from the tools. If the tools communicate
     # the deployment's data, then we are the headnode.
-    if !restore_appcontroller_state()
+    unless restore_appcontroller_state()
+      # Remove old copies of the RESERVED apps code. We need a fresh copy
+      # every time we boot.
+      RESERVED_APPS.each { |reserved_app|
+        app_dir = "#{HelperFunctions.get_app_path(reserved_app)}/app"
+        app_path = "#{PERSISTENT_MOUNT_POINT}/apps/#{reserved_app}.tar.gz"
+        FileUtils.rm_rf([app_dir, app_path])
+      }
       erase_old_data()
       wait_for_data()
     end
@@ -1873,8 +1887,9 @@ class Djinn
     # Initialize the current server and starts all the API and essential
     # services. The functions are idempotent ie won't restart already
     # running services and can be ran multiple time with no side effect.
-    initialize_server()
-    start_api_services()
+    initialize_server
+    write_zookeeper_locations()
+    start_api_services
 
     # Now that we are done loading, we can set the monit job to check the
     # AppController. At this point we are resilient to failure (ie the AC
@@ -1882,7 +1897,6 @@ class Djinn
     set_appcontroller_monit()
     @done_loading = true
 
-    write_zookeeper_locations()
     pick_zookeeper(@zookeeper_data)
     write_our_node_info()
     wait_for_nodes_to_finish_loading(@nodes)
@@ -1892,35 +1906,28 @@ class Djinn
     last_print = Time.now.to_i
 
     check_health = nil
-    while !@kill_sig_received do
+    until @kill_sig_received do
       write_database_info()
       update_firewall()
       write_memcache_locations()
       write_zookeeper_locations()
-      @state = "Looking up a zookeeper server"
-      pick_zookeeper(@zookeeper_data)
 
-      # Reload state from head node.
-      if my_node.is_login?
-        flush_log_buffer()
-        send_instance_info_to_dashboard()
-        update_node_info_cache()
-      else
-        # Every other node syncs its state with the login's node state.
-        if !restore_appcontroller_state()
-          Djinn.log_warn("Cannot talk to zookeeper: in isolated mode.")
-          next
-        end
-      end
+      # This call will block if we cannot reach a zookeeper node, but will
+      # be very fast if we have an available connection. The function sets
+      # the state in case we are looking for a zookeeper server.
+      pick_zookeeper(@zookeeper_data)
 
       @state = "Done starting up AppScale, now in heartbeat mode"
 
-      # Only the shadow backup the deployment state to zookeeper.
-      backup_appcontroller_state() if my_node.is_shadow?
-
       # The following is the core of the duty cycle: start new apps,
       # restart apps, terminate non-responsive AppServers, and autoscale.
-      if my_node.is_login?
+      # Every other node syncs its state with the login node state.
+      if my_node.is_shadow?
+        flush_log_buffer()
+        send_instance_info_to_dashboard()
+        update_node_info_cache()
+        backup_appcontroller_state()
+
         if check_health.nil?
           check_health = Thread.new {
             check_nodes_health()
@@ -1929,11 +1936,25 @@ class Djinn
           check_health.join()
           check_health = nil
         end
-        starts_new_apps_or_appservers()
-        scale_appservers_within_nodes()
+        APPS_LOCK.synchronize {
+          starts_new_apps_or_appservers()
+          scale_appservers_within_nodes()
+        }
         scale_appservers_across_nodes()
+      elsif !restore_appcontroller_state()
+        Djinn.log_warn("Cannot talk to zookeeper: in isolated mode.")
+        next
       end
+
       check_running_apps()
+      check_stopped_apps()
+
+      # Login nodes may need to check/update nginx/haproxy.
+      if my_node.is_load_balancer?
+        APPS_LOCK.synchronize {
+          regenerate_routing_config()
+        }
+      end
 
       # Print stats in the log recurrently; works as a heartbeat mechanism.
       if last_print < (Time.now.to_i - 60 * PRINT_STATS_MINUTES)
@@ -1958,14 +1979,15 @@ class Djinn
     start_cmd = "#{PYTHON27} #{iaas_script}"
     stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
           "#{iaas_script} #{PYTHON27}"
-    port = [InfrastructureManagerClient::SERVER_PORT]
+    port = InfrastructureManagerClient::SERVER_PORT
     env = {
       'APPSCALE_HOME' => APPSCALE_HOME,
       'EC2_HOME' => ENV['EC2_HOME'],
       'JAVA_HOME' => ENV['JAVA_HOME']
     }
 
-    MonitInterface.start(:iaas_manager, start_cmd, stop_cmd, port, env)
+    MonitInterface.start(:iaas_manager, start_cmd, stop_cmd, [port], env,
+                         start_cmd, nil, nil, nil)
     Djinn.log_info("Started InfrastructureManager successfully!")
   end
 
@@ -1977,9 +1999,7 @@ class Djinn
 
 
   def get_online_users_list(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     online_users = []
 
@@ -1995,9 +2015,7 @@ class Djinn
   end
 
   def done_uploading(appname, location, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     if File.exists?(location)
       begin
@@ -2019,9 +2037,7 @@ class Djinn
   end
 
   def is_app_running(appname, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     hosters = ZKInterface.get_app_hosters(appname, @options['keyname'])
     hosters_w_appengine = []
@@ -2036,9 +2052,7 @@ class Djinn
 
 
   def add_role(new_role, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     # new roles may run indefinitely in the background, so don't block
     # on them - just fire and forget
@@ -2062,9 +2076,7 @@ class Djinn
   end
 
   def remove_role(old_role, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     my_node.remove_roles(old_role)
     stop_roles = old_role.split(":")
@@ -2094,9 +2106,7 @@ class Djinn
   #   Otherwise, returns a Hash that maps IP addresses to the roles that
   #     will be hosted on them (the inverse of ips_hash).
   def start_roles_on_nodes(ips_hash, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     ips_hash = JSON.load(ips_hash)
     if ips_hash.class != Hash
@@ -2155,10 +2165,9 @@ class Djinn
     Djinn.log_info("Starting new roles in cloud with following info: " +
       "#{ips_to_roles.inspect}")
 
-    keyname = @options['keyname']
     num_of_vms = ips_to_roles.keys.length
     roles = ips_to_roles.values
-    disks = Array.new(size=num_of_vms, obj=nil)  # no persistent disks
+    disks = Array.new(num_of_vms, nil)  # no persistent disks
     Djinn.log_info("Need to spawn up #{num_of_vms} VMs")
     imc = InfrastructureManagerClient.new(@@secret)
 
@@ -2176,10 +2185,6 @@ class Djinn
 
     add_nodes(new_nodes_info)
     update_hosts_info()
-
-    if my_node.is_login?
-      regenerate_nginx_config_files()
-    end
 
     return new_nodes_info
   end
@@ -2204,7 +2209,6 @@ class Djinn
       "#{ips_to_roles.inspect}")
 
     nodes_info = []
-    keyname = @options['keyname']
     ips_to_roles.each { |ip, roles|
       Djinn.log_info("Will add roles #{roles.join(', ')} to new " +
         "node at IP address #{ip}")
@@ -2219,10 +2223,6 @@ class Djinn
     add_nodes(nodes_info)
     update_hosts_info()
 
-    if my_node.is_login?
-      regenerate_nginx_config_files()
-    end
-
     return nodes_info
   end
 
@@ -2231,9 +2231,7 @@ class Djinn
   # combination of the two. 'nodes_needed' should be an Array, where each
   # item is an Array of the roles to start on each node.
   def start_new_roles_on_nodes(nodes_needed, instance_type, secret)
-     if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     if nodes_needed.class != Array
       Djinn.log_error("Was expecting nodes_needed to be an Array, not " +
@@ -2247,9 +2245,7 @@ class Djinn
 
     vms_to_use = []
     ZKInterface.lock_and_run {
-      num_of_vms_needed = nodes_needed.length
-
-      @nodes.each_with_index { |node, index|
+      @nodes.each { |node|
         if node.is_open?
           Djinn.log_info("Will use node #{node} to run new roles")
           node.jobs = nodes_needed[vms_to_use.length]
@@ -2280,14 +2276,14 @@ class Djinn
             "would put us over the user-specified limit of #{@options['max_images']} " +
             "VMs. Instead, spawning up #{allowed_vms}.")
           vms_to_spawn = allowed_vms
-          if vms_to_spawn.zero?
+          if vms_to_spawn <= 0
             Djinn.log_error("Reached the maximum number of VMs that we " +
               "can use in this cloud deployment, so not spawning more nodes.")
             return "Reached maximum number of VMs we can use."
           end
         end
 
-        disks = Array.new(size=vms_to_spawn, obj=nil)  # no persistent disks
+        disks = Array.new(vms_to_spawn, nil)  # no persistent disks
 
         # start up vms_to_spawn vms as open
         imc = InfrastructureManagerClient.new(@@secret)
@@ -2364,13 +2360,12 @@ class Djinn
   # Cleans out temporary files that may have been written by a previous
   # AppScale deployment.
   def erase_old_data()
-    Djinn.log_run("rm -rf #{Dir.tmpdir}/h*")
     Djinn.log_run("rm -f ~/.appscale_cookies")
 
     Nginx.clear_sites_enabled()
     HAProxy.clear_sites_enabled()
     Djinn.log_run("echo '' > /root/.ssh/known_hosts") # empty it out but leave the file there
-    CronHelper.clear_app_crontabs
+    CronHelper.clear_app_crontabs()
   end
 
 
@@ -2598,9 +2593,6 @@ class Djinn
   def get_public_ip(private_ip)
     return private_ip unless is_cloud?
 
-    keyname = @options['keyname']
-    infrastructure = @options['infrastructure']
-
     Djinn.log_debug("Looking for #{private_ip}")
     private_ip = HelperFunctions.convert_fqdn_to_ip(private_ip)
     Djinn.log_debug("[converted] Looking for #{private_ip}")
@@ -2626,9 +2618,7 @@ class Djinn
   # Args:
   #   secret: A String password that is used to authenticate SOAP callers.
   def gather_logs(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     uuid = HelperFunctions.get_random_alphanumeric()
     Djinn.log_info("Generated uuid #{uuid} for request to gather logs.")
@@ -2681,25 +2671,31 @@ class Djinn
   #   - NOT_READY: If this node runs HAProxy, but hasn't allocated ports for
   #     it and nginx yet. Callers should retry at a later time.
   def add_routing_for_appserver(app_id, ip, port, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
+    return BAD_SECRET_MSG unless valid_secret?(secret)
+
+    unless my_node.is_shadow?
+       # We need to send the call to the shadow.
+       Djinn.log_debug("Sending routing call for #{app_id} to shadow.")
+       acc = AppControllerClient.new(get_shadow.private_ip, @@secret)
+       begin
+         return acc.add_routing_for_appserver(app_id, ip, port)
+       rescue FailedNodeException => except
+         Djinn.log_warn("Failed to forward routing call to shadow (#{get_shadow}).")
+         return NOT_READY
+       end
     end
 
-    if !my_node.is_login?
-      return NO_HAPROXY_PRESENT
-    end
-
-    if @app_info_map[app_id].nil? or @app_info_map[app_id]['appengine'].nil?
-      return NOT_READY
-    elsif @app_info_map[app_id]['appengine'].include?("#{ip}:#{port}")
-      Djinn.log_warn("Already registered AppServer for app #{app_id} at #{ip}:#{port}.")
-      return INVALID_REQUEST
-    end
-
-    Djinn.log_debug("Adding AppServer for app #{app_id} at #{ip}:#{port}.")
-
-    # Find and remove an entry for this AppServer node and app.
     APPS_LOCK.synchronize {
+      if @app_info_map[app_id].nil? or @app_info_map[app_id]['appengine'].nil?
+        return NOT_READY
+      elsif @app_info_map[app_id]['appengine'].include?("#{ip}:#{port}")
+        Djinn.log_warn("Already registered AppServer for app #{app_id} at #{ip}:#{port}.")
+        return INVALID_REQUEST
+      end
+
+      Djinn.log_debug("Adding AppServer for app #{app_id} at #{ip}:#{port}.")
+
+      # Find and remove an entry for this AppServer node and app.
       match = @app_info_map[app_id]['appengine'].index("#{ip}:-1")
       if match
         @app_info_map[app_id]['appengine'].delete_at(match)
@@ -2708,62 +2704,6 @@ class Djinn
       end
       @app_info_map[app_id]['appengine'] << "#{ip}:#{port}"
     }
-
-    HAProxy.update_app_config(my_node.private_ip, app_id,
-      @app_info_map[app_id])
-
-    unless Nginx.is_app_already_configured(app_id)
-      # Get static handlers and make sure cache path is readable.
-      begin
-        static_handlers = HelperFunctions.parse_static_data(app_id)
-        Djinn.log_run("chmod -R +r #{HelperFunctions.get_cache_path(app_id)}")
-      rescue => e
-        # This specific exception may be a JSON parse error.
-        error_msg = "ERROR: Unable to parse app.yaml file for #{app_id}. "\
-          "Exception of #{e.class} with message #{e.message}"
-        place_error_app(app_id, error_msg, @app_info_map[app_id]['language'])
-        static_handlers = []
-      end
-
-      http_port = @app_info_map[app_id]['nginx']
-      https_port = @app_info_map[app_id]['nginx_https']
-
-      # Make sure the Nginx port is opened after HAProxy is configured.
-      Nginx.write_fullproxy_app_config(
-        app_id,
-        http_port,
-        https_port,
-        my_node.public_ip,
-        my_node.private_ip,
-        @app_info_map[app_id]['haproxy'],
-        static_handlers,
-        get_login.private_ip,
-        @app_info_map[app_id]['language']
-      )
-
-      uac = UserAppClient.new(my_node.private_ip, @@secret)
-      loop {
-        success = uac.add_instance(app_id, my_node.public_ip,
-          http_port, https_port)
-        if success
-          Djinn.log_info("Committed application info for #{app_id} " +
-            "to user_app_server")
-        end
-        begin
-          if success
-            # tell ZK that we are hosting the app in case we die, so that
-            # other nodes can update the UserAppServer on its behalf
-            ZKInterface.add_app_instance(app_id, my_node.public_ip, http_port)
-            break
-          end
-        rescue FailedZooKeeperOperationException
-          Djinn.log_info("Couldn't talk to zookeeper while trying " +
-            "to add instance for application #{app_id}: retrying.")
-        end
-        Kernel.sleep(SMALL_WAIT)
-      }
-      Djinn.log_info("Done setting full proxy for #{app_id}.")
-    end
 
     return "OK"
   end
@@ -2779,13 +2719,8 @@ class Djinn
   #   - BAD_SECRET_MSG: If the caller cannot be authenticated.
   #   - NO_HAPROXY_PRESENT: If this node does not run HAProxy.
   def add_routing_for_blob_server(secret)
-    unless valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
-
-    unless my_node.is_login?
-      return NO_HAPROXY_PRESENT
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
+    return NO_HAPROXY_PRESENT unless my_node.is_load_balancer?
 
     Djinn.log_debug('Adding BlobServer routing.')
     servers = []
@@ -2818,12 +2753,18 @@ class Djinn
   #   - NO_HAPROXY_PRESENT: If this node does not run HAProxy (and thus cannot
   #     remove AppServers from HAProxy config files).
   def remove_appserver_from_haproxy(app_id, ip, port, secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
-    if !my_node.is_login?
-      return NO_HAPROXY_PRESENT
+    unless my_node.is_shadow?
+       Djinn.log_debug("Sending remote_appserver_from_haproxy call for #{app_id} to shadow.")
+       acc = AppControllerClient.new(get_shadow.private_ip, @@secret)
+       begin
+         return acc.remove_appserver_from_haproxy(app_id, ip, port)
+       rescue FailedNodeException => except
+         Djinn.log_warn("Failed to forward remote_appserver_from_haproxy" +
+            " call to shadow (#{get_shadow}).")
+         return NOT_READY
+       end
     end
 
     Djinn.log_info("Removing AppServer for app #{app_id} at #{ip}:#{port}")
@@ -2868,6 +2809,19 @@ class Djinn
     Nginx.reload()
   end
 
+  # Creates HAProxy configuration for the TaskQueue REST API.
+  def configure_tq_routing()
+    all_tq_ips = []
+    @nodes.each { | node |
+      if node.is_taskqueue_master? || node.is_taskqueue_slave?
+        all_tq_ips.push(node.private_ip)
+      end
+    }
+    HAProxy.create_tq_endpoint_config(all_tq_ips,
+      my_node.private_ip, TaskQueue::HAPROXY_PORT)
+    Nginx.create_taskqueue_rest_config(my_node.private_ip)
+    Nginx.reload()
+  end
 
   def write_database_info()
     table = @options['table']
@@ -2886,9 +2840,7 @@ class Djinn
   def update_firewall()
     all_ips = []
     @nodes.each { |node|
-      if !all_ips.include? node.private_ip
-        all_ips << node.private_ip
-      end
+      (all_ips << node.private_ip) unless all_ips.include? node.private_ip
     }
     all_ips << "\n"
     HelperFunctions.write_file("#{APPSCALE_CONFIG_DIR}/all_ips", all_ips.join("\n"))
@@ -2904,28 +2856,31 @@ class Djinn
 
 
   def backup_appcontroller_state()
-    state = {'@@secret' => @@secret }
-    instance_variables.each { |k|
-      v = instance_variable_get(k)
-      if k.to_s == "@nodes"
-        v = Djinn.convert_location_class_to_array(v)
-      elsif k == "@my_index" or k == "@api_status"
-        # Don't back up @my_index - it's a node-specific pointer that
-        # indicates which node is "our node" and thus should be regenerated
-        # via find_me_in_locations.
-        # Also don't worry about @api_status - (used to be for deprecated
-        # API checker) it can take up a lot of space and can easily be
-        # regenerated with new data.
-        next
-      end
+    local_state = {}
+    APPS_LOCK.synchronize {
+      local_state = {'@@secret' => @@secret }
+      instance_variables.each { |k|
+        v = instance_variable_get(k)
+        if k.to_s == "@nodes"
+          v = Djinn.convert_location_class_to_array(v)
+        elsif k == "@my_index" or k == "@api_status"
+          # Don't back up @my_index - it's a node-specific pointer that
+          # indicates which node is "our node" and thus should be regenerated
+          # via find_me_in_locations.
+          # Also don't worry about @api_status - (used to be for deprecated
+          # API checker) it can take up a lot of space and can easily be
+          # regenerated with new data.
+          next
+        end
 
-      state[k] = v
+        local_state[k] = v
+      }
     }
 
-    Djinn.log_debug("backup_appcontroller_state:"+state.to_s)
+    Djinn.log_debug("backup_appcontroller_state:"+local_state.to_s)
 
     begin
-      ZKInterface.write_appcontroller_state(state)
+      ZKInterface.write_appcontroller_state(local_state)
     rescue FailedZooKeeperOperationException => e
       Djinn.log_warn("Couldn't talk to zookeeper whle backing up " +
         "appcontroller state with #{e.message}.")
@@ -2939,10 +2894,10 @@ class Djinn
   # Returns:
   #   A boolean to indicate if we were able to restore the state.
   def restore_appcontroller_state()
-    Djinn.log_info("Restoring AppController state")
+    Djinn.log_debug("Reloading deployment state.")
     json_state=""
 
-    if !File.exists?(ZK_LOCATIONS_FILE)
+    unless File.exists?(ZK_LOCATIONS_FILE)
       Djinn.log_info("#{ZK_LOCATIONS_FILE} doesn't exist: not restoring data.")
       return false
     end
@@ -2955,43 +2910,45 @@ class Djinn
         json_state = ""
         Kernel.sleep(SMALL_WAIT)
       end
-      break if !json_state.empty?
+      break unless json_state.empty?
       Djinn.log_warn("Unable to get state from zookeeper: trying again.")
       pick_zookeeper(@zookeeper_data)
     }
-    Djinn.log_info("Reload State : #{json_state}")
+    Djinn.log_debug("Reload State : #{json_state}.")
 
-    @@secret = json_state['@@secret']
-    keyname = json_state['@options']['keyname']
+    APPS_LOCK.synchronize {
+      @@secret = json_state['@@secret']
+      keyname = json_state['@options']['keyname']
 
-    # Puts json_state.
-    json_state.each { |k, v|
-      next if k == "@@secret"
-      if k == "@nodes"
-        v = Djinn.convert_location_array_to_class(JSON.load(v), keyname)
+      # Puts json_state.
+      json_state.each { |k, v|
+        next if k == "@@secret"
+        if k == "@nodes"
+          v = Djinn.convert_location_array_to_class(JSON.load(v), keyname)
+        end
+        # my_private_ip and my_public_ip instance variables are from the head
+        # node. This node may or may not be the head node, so set those
+        # from local files. state_change_lock is a Monitor: no need to
+        # restore it.
+        if k == "@my_private_ip"
+          @my_private_ip = HelperFunctions.read_file("#{APPSCALE_CONFIG_DIR}/my_private_ip").chomp
+        elsif k == "@my_public_ip"
+          @my_public_ip = HelperFunctions.read_file("#{APPSCALE_CONFIG_DIR}/my_public_ip").chomp
+        elsif DEPLOYMENT_STATE.include?(k)
+          instance_variable_set(k, v)
+        end
+      }
+
+      # Check to see if our IP address has changed. If so, we need to update all
+      # of our internal state to use the new public and private IP anywhere the
+      # old ones were present.
+      unless HelperFunctions.get_all_local_ips().include?(@my_private_ip)
+        Djinn.log_info("IP changed old private:#{@my_private_ip} public:#{@my_public_ip}.")
+        update_state_with_new_local_ip()
+        Djinn.log_info("IP changed new private:#{@my_private_ip} public:#{@my_public_ip}.")
       end
-      # my_private_ip and my_public_ip instance variables are from the head
-      # node. This node may or may not be the head node, so set those
-      # from local files. state_change_lock is a Monitor: no need to
-      # restore it.
-      if k == "@my_private_ip"
-        @my_private_ip = HelperFunctions.read_file("#{APPSCALE_CONFIG_DIR}/my_private_ip").chomp
-      elsif k == "@my_public_ip"
-        @my_public_ip = HelperFunctions.read_file("#{APPSCALE_CONFIG_DIR}/my_public_ip").chomp
-      elsif DEPLOYMENT_STATE.include?(k)
-        instance_variable_set(k, v)
-      end
+      Djinn.log_debug("app_info_map after restore is #{@app_info_map}.")
     }
-
-    # Check to see if our IP address has changed. If so, we need to update all
-    # of our internal state to use the new public and private IP anywhere the
-    # old ones were present.
-    if !HelperFunctions.get_all_local_ips().include?(@my_private_ip)
-      Djinn.log_info("IP changed old private:#{@my_private_ip} public:#{@my_public_ip}.")
-      update_state_with_new_local_ip()
-      Djinn.log_info("IP changed new private:#{@my_private_ip} public:#{@my_public_ip}.")
-    end
-    Djinn.log_debug("app_info_map after restore is #{@app_info_map}.")
 
     # Now that we've restored our state, update the pointer that indicates
     # which node in @nodes is ours
@@ -3043,7 +3000,7 @@ class Djinn
       @options['hostname'] = new_public_ip
     end
 
-    if !is_cloud?
+    unless is_cloud?
       nodes = JSON.load(@options['ips'])
       nodes.each { |node|
         if node['ip'] == old_private_ip
@@ -3053,7 +3010,7 @@ class Djinn
       @options['ips'] = JSON.dump(nodes)
     end
 
-    @app_info_map.each { |appid, app_info|
+    @app_info_map.each { |_app_id, app_info|
       if app_info['appengine'].nil?
         next
       end
@@ -3091,7 +3048,7 @@ class Djinn
 
     @nodes.each { |node|
       if node.is_zookeeper?
-        if !zookeeper_data['locations'].include? node.private_ip
+        unless zookeeper_data['locations'].include? node.private_ip
           zookeeper_data['locations'] << node.private_ip
         end
       end
@@ -3116,6 +3073,9 @@ class Djinn
     end
     loop {
       break if ZKInterface.is_connected?
+
+      @state = NO_ZOOKEEPER_CONNECTION
+
       ip = zk_list.sample()
       Djinn.log_info("Trying to use zookeeper server at #{ip}.")
       ZKInterface.init_to_ip(HelperFunctions.local_ip(), ip.to_s)
@@ -3169,16 +3129,19 @@ class Djinn
         # database, depending on the verbosity and the deployment.
         if @options['controller_logs_to_dashboard'].downcase == "true"
           begin
-            url = URI.parse("https://#{get_login.public_ip}:" +
+            url = URI.parse("https://#{get_load_balancer_ip()}:" +
               "#{AppDashboard::LISTEN_SSL_PORT}/logs/upload")
             http = Net::HTTP.new(url.host, url.port)
             http.verify_mode = OpenSSL::SSL::VERIFY_NONE
             http.use_ssl = true
             response = http.post(url.path, encoded_logs,
               {'Content-Type'=>'application/json'})
+            Djinn.log_debug("Done flushing logs to AppDashboard. " +
+              "Response is: #{response.body}.")
           rescue
             # Don't crash the AppController because we weren't able to send over
             # the logs - just continue on.
+            Djinn.log_debug("Ignoring exception talking to dashboard.")
           end
         end
       }
@@ -3206,7 +3169,7 @@ class Djinn
       }
 
       begin
-        url = URI.parse("https://#{get_login.public_ip}:" +
+        url = URI.parse("https://#{get_load_balancer_ip()}:" +
           "#{AppDashboard::LISTEN_SSL_PORT}/apps/stats/instances")
         http = Net::HTTP.new(url.host, url.port)
         http.use_ssl = true
@@ -3246,7 +3209,7 @@ class Djinn
         'port' => Integer(port)
       }]
 
-      url = URI.parse("https://#{get_login.public_ip}:" +
+      url = URI.parse("https://#{get_load_balancer_ip()}:" +
         "#{AppDashboard::LISTEN_SSL_PORT}/apps/stats/instances")
       http = Net::HTTP.new(url.host, url.port)
       http.use_ssl = true
@@ -3308,7 +3271,7 @@ class Djinn
         ZKInterface.set_done_loading(my_node.public_ip, false)
 
         roles_to_start = new_roles - old_roles
-        if !roles_to_start.empty?
+        unless roles_to_start.empty?
           Djinn.log_info("Need to start [#{roles_to_start.join(', ')}] " +
             "roles on this node")
           roles_to_start.each { |role|
@@ -3318,7 +3281,7 @@ class Djinn
         end
 
         roles_to_stop = old_roles - new_roles
-        if !roles_to_stop.empty?
+        unless roles_to_stop.empty?
           Djinn.log_info("Need to stop [#{roles_to_stop.join(', ')}] " +
             "roles on this node")
           roles_to_stop.each { |role|
@@ -3332,12 +3295,6 @@ class Djinn
         @done_loading = true
 
         @last_updated = zk_ips_info['last_updated']
-
-        # Finally, since the node layout changed, there may be a change in the
-        # list of AppServers, so update nginx / haproxy accordingly.
-        if my_node.is_login?
-          regenerate_nginx_config_files()
-        end
       }
     rescue => e
       Djinn.log_warn("(update_local_node) saw exception #{e.message}")
@@ -3345,22 +3302,6 @@ class Djinn
     end
 
     return true
-  end
-
-
-  def remove_app_hosting_data_for_node(ip)
-    instances_to_delete = ZKInterface.get_app_instances_for_ip(ip)
-    uac = UserAppClient.new(my_node.private_ip, @@secret)
-    instances_to_delete.each { |instance|
-      Djinn.log_info("Deleting app instance for app #{instance['app_name']}" +
-        " located at #{instance['ip']}:#{instance['port']}")
-      begin
-        uac.delete_instance(instance['app_name'], instance['ip'],
-          instance['port'])
-      rescue FailedNodeException
-        Djinn.log_warn("Coulnd't talk to #{ip} to stop all applications")
-      end
-    }
   end
 
 
@@ -3418,18 +3359,14 @@ class Djinn
     my_key_loc = "#{my_key_dir}/#{keypath}"
     Djinn.log_debug("Creating directory #{my_key_dir} for my ssh key #{my_key_loc}")
     FileUtils.mkdir_p(my_key_dir)
-    Djinn.log_run("cp #{APPSCALE_CONFIG_DIR}/ssh.key #{my_key_loc}")
+    Djinn.log_run("chmod 600 #{APPSCALE_CONFIG_DIR}/ssh.key")
+    Djinn.log_run("cp -p #{APPSCALE_CONFIG_DIR}/ssh.key #{my_key_loc}")
 
-    if is_cloud?
-      # for euca
+    # AWS and Euca need some evironmental variables.
+    if ["ec2", "euca"].include?(@options['infrastructure'])
       ENV['EC2_ACCESS_KEY'] = @options['ec2_access_key']
       ENV['EC2_SECRET_KEY'] = @options['ec2_secret_key']
       ENV['EC2_URL'] = @options['ec2_url']
-
-      # for ec2
-      cloud_keys_dir = File.expand_path("#{APPSCALE_CONFIG_DIR}/keys/cloud1")
-      ENV['EC2_PRIVATE_KEY'] = "#{cloud_keys_dir}/mykey.pem"
-      ENV['EC2_CERT'] = "#{cloud_keys_dir}/mycert.pem"
     end
 
     write_database_info()
@@ -3544,9 +3481,7 @@ class Djinn
   def valid_format_for_credentials(possible_credentials)
     required_fields = ["table", "hostname", "ips", "keyname"]
     required_fields.each { |field|
-      if !possible_credentials[field]
-        return false
-      end
+      return false unless possible_credentials[field]
     }
 
     return true
@@ -3556,6 +3491,13 @@ class Djinn
     newoptions = {}
     @options.each { |key, val|
       if ['ips', 'user_commands'].include?(key)
+        newoptions[key] = val
+        next
+      end
+
+      # Azure secret key contains an '=' and we do not need
+      # sanitization for it.
+      if 'azure_app_secret_key' == key
         newoptions[key] = val
         next
       end
@@ -3590,7 +3532,6 @@ class Djinn
     threads << Thread.new {
       if not is_zookeeper_running?
         if my_node.is_zookeeper?
-          Djinn.log_info("Starting zookeeper.")
           configure_zookeeper(@nodes, @my_index)
           begin
             start_zookeeper(@options['clear_datastore'].downcase == "true")
@@ -3626,10 +3567,11 @@ class Djinn
     threads.each { |t| t.join() }
 
     Djinn.log_info('Ensuring necessary database tables are present')
-    sleep(SMALL_WAIT) until system("#{PRIME_SCRIPT} --check")
+    sleep(SMALL_WAIT) until system("#{PRIME_SCRIPT} --check > /dev/null 2>&1")
 
+    Djinn.log_info('Ensuring data layout version is correct')
     layout_script = "#{APPSCALE_HOME}/AppDB/scripts/appscale-data-layout"
-    unless system("#{layout_script} --db-type cassandra")
+    unless system("#{layout_script} --db-type cassandra > /dev/null 2>&1")
       HelperFunctions.log_and_crash(
         'Unexpected data layout version. Please run "appscale upgrade".')
     end
@@ -3650,7 +3592,7 @@ class Djinn
       UserAppClient::SSL_SERVER_PORT, USE_SSL)
     uac = UserAppClient.new(@my_private_ip, @@secret)
     begin
-      app_list = uac.get_all_apps()
+      uac.does_app_exist?("not-there")
     rescue FailedNodeException
       Djinn.log_debug("UserAppServer not ready yet: retrying.")
       retry
@@ -3683,13 +3625,22 @@ class Djinn
       }
     end
 
-    if my_node.is_login?
+    if my_node.is_load_balancer?
       threads << Thread.new {
         start_ejabberd()
+        configure_tq_routing()
       }
     end
 
-    # All nodes have application managers
+    # The headnode needs to ensure we have the appscale user, and it needs
+    # to prepare the dashboard to be started.
+    if my_node.is_shadow?
+      threads << Thread.new {
+        create_appscale_user()
+        prep_app_dashboard()
+      }
+    end
+
     threads << Thread.new {
       start_app_manager_server()
     }
@@ -3722,10 +3673,9 @@ class Djinn
     threads.each { |t| t.join() }
     Djinn.log_info("API services have started on this node")
 
-    # Login node starts additional services.
-    if my_node.is_login?
+    # Leader node starts additional services.
+    if my_node.is_shadow?
       update_node_info_cache()
-      start_app_dashboard(get_login.public_ip, my_node.private_ip)
       start_hermes()
       TaskQueue.start_flower(@options['flower_password'])
     end
@@ -3745,12 +3695,25 @@ class Djinn
     prime_script = "#{APPSCALE_HOME}/AppDB/#{table}_env/prime_#{table}.py"
     replication = Integer(@options['replication'])
     retries = 10
+    Djinn.log_info('Ensuring necessary tables have been created')
     loop {
-      return if system("#{prime_script} --replication #{replication}")
-      Djinn.log_warn("Failed to prime database. #{retries} retries left.")
-      Kernel.sleep(SMALL_WAIT)
+      prime_cmd = "#{prime_script} --replication #{replication} >> " +
+        '/var/log/appscale/prime_db.log 2>&1'
+      return if system(prime_cmd)
       retries -= 1
+      Djinn.log_warn("Failed to prime database. #{retries} retries left.")
+
+      # If this has failed 10 times in a row, it's probably a
+      # "Column ID mismatch" error that seems to be caused by creating tables
+      # as the cluster is settling. Running a repair may fix the issue.
+      if retries == 1
+        @state = 'Running a Cassandra repair.'
+        Djinn.log_warn(@state)
+        system("#{NODETOOL} repair")
+      end
+
       break if retries.zero?
+      Kernel.sleep(SMALL_WAIT)
     }
 
     @state = "Failed to prime #{table}."
@@ -3787,7 +3750,9 @@ class Djinn
   end
 
   def start_taskqueue_master()
-    TaskQueue.start_master(@options['clear_datastore'].downcase == "true")
+    clear_datastore = @options['clear_datastore'].downcase == "true"
+    verbose = @options['verbose'].downcase == "true"
+    TaskQueue.start_master(clear_datastore, verbose)
     return true
   end
 
@@ -3799,7 +3764,9 @@ class Djinn
       master_ip = node.private_ip if node.is_taskqueue_master?
     }
 
-    TaskQueue.start_slave(master_ip, @options['clear_datastore'].downcase == "true")
+    clear_datastore = @options['clear_datastore'].downcase == "true"
+    verbose = @options['verbose'].downcase == "true"
+    TaskQueue.start_slave(master_ip, clear_datastore, verbose)
     return true
   end
 
@@ -3812,8 +3779,9 @@ class Djinn
     start_cmd = "#{PYTHON27} #{app_manager_script}"
     stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
           "#{app_manager_script} #{PYTHON27}"
-    port = [AppManagerClient::SERVER_PORT]
-    MonitInterface.start(:appmanagerserver, start_cmd, stop_cmd, port, env_vars)
+    port = AppManagerClient::SERVER_PORT
+    MonitInterface.start(:appmanagerserver, start_cmd, stop_cmd, [port],
+                         env_vars, start_cmd, nil, nil, nil)
   end
 
   # Starts the Hermes service on this node.
@@ -3860,14 +3828,14 @@ class Djinn
             "-t #{table}"].join(' ')
     stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
           "#{soap_script} #{PYTHON27}"
-    port = [UserAppClient::SERVER_PORT]
+    port = UserAppClient::SERVER_PORT
 
-    MonitInterface.start(:uaserver, start_cmd, stop_cmd, port, env_vars)
+    MonitInterface.start(:uaserver, start_cmd, stop_cmd, [port], env_vars,
+                         start_cmd, nil, nil, nil)
   end
 
   def start_datastore_server
     db_master_ip = nil
-    my_ip = my_node.public_ip
     verbose = @options['verbose'].downcase == 'true'
     @nodes.each { |node|
       db_master_ip = node.private_ip if node.is_db_master?
@@ -3875,8 +3843,7 @@ class Djinn
     HelperFunctions.log_and_crash("db master ip was nil") if db_master_ip.nil?
 
     table = @options['table']
-    DatastoreServer.start(db_master_ip, my_node.private_ip, table,
-      verbose=verbose)
+    DatastoreServer.start(db_master_ip, my_node.private_ip, table, verbose)
     HAProxy.create_datastore_server_config(my_node.private_ip, DatastoreServer::PROXY_PORT, table)
 
     # Let's wait for the datastore to be active.
@@ -3933,8 +3900,7 @@ class Djinn
 
   def spawn_and_setup_appengine()
     # should also make sure the tools are on the vm and the envvars are set
-
-    table = @options['table']
+    keyname = @options['keyname']
 
     machines = JSON.load(@options['ips'])
     appengine_info = spawn_appengine(machines)
@@ -3942,7 +3908,6 @@ class Djinn
 
     @state = "Copying over needed files and starting the AppController on the other VMs"
 
-    keyname = @options['keyname']
     appengine_info = Djinn.convert_location_array_to_class(appengine_info, keyname)
     appengine_info = convert_fqdns_to_ips(appengine_info)
     @state_change_lock.synchronize {
@@ -4038,27 +4003,20 @@ class Djinn
     HelperFunctions.sleep_until_port_is_open(ip, SSH_PORT)
 
     # Get the username to use for ssh (depends on environments).
-    user_name = "ubuntu"
     if ["ec2", "euca"].include?(@options['infrastructure'])
       # Add deployment key to remote instance's authorized_keys.
-      options = '-o StrictHostkeyChecking=no -o NumberOfPasswordPrompts=0'
-      backup_keys = 'sudo cp -p /root/.ssh/authorized_keys ' +
-        '/root/.ssh/authorized_keys.old'
-      Djinn.log_run("ssh -i #{ssh_key} #{options} 2>&1 #{user_name}@#{ip} " +
-        "'#{backup_keys}'")
-
-      merge_keys = 'sudo sed -n ' +
-        '"/Please login/d; w/root/.ssh/authorized_keys" ' +
-        "~#{user_name}/.ssh/authorized_keys /root/.ssh/authorized_keys.old"
-      Djinn.log_run("ssh -i #{ssh_key} #{options} 2>&1 #{user_name}@#{ip} " +
-        "'#{merge_keys}'")
+      user_name = "ubuntu"
+      enable_root_login(ip, ssh_key, user_name)
     elsif @options['infrastructure'] == "gce"
       # Since GCE v1beta15, SSH keys don't immediately get injected to newly
       # spawned VMs. It takes around 30 seconds, so sleep a bit longer to be
       # sure.
-      user_name = "#{@options['gce_user']}"
       Djinn.log_debug("Waiting for SSH keys to get injected to #{ip}.")
       Kernel.sleep(60)
+
+    elsif @options['infrastructure'] == 'azure'
+      user_name = 'azureuser'
+      enable_root_login(ip, ssh_key, user_name)
     end
 
     Kernel.sleep(SMALL_WAIT)
@@ -4074,13 +4032,8 @@ class Djinn
     cloud_keys_dir = File.expand_path("#{APPSCALE_CONFIG_DIR}/keys/cloud1")
     make_dir = "mkdir -p #{cloud_keys_dir}"
 
-    cloud_private_key = "#{cloud_keys_dir}/mykey.pem"
-    cloud_cert = "#{cloud_keys_dir}/mycert.pem"
-
     HelperFunctions.run_remote_command(ip, make_dir, ssh_key, NO_OUTPUT)
-    HelperFunctions.scp_file(ssh_key, ssh_key, ip, ssh_key)
-    HelperFunctions.scp_file(cloud_private_key, cloud_private_key, ip, ssh_key)
-    HelperFunctions.scp_file(cloud_cert, cloud_cert, ip, ssh_key)
+    HelperFunctions.scp_file(ssh_key, "#{APPSCALE_CONFIG_DIR}/ssh.key", ip, ssh_key)
 
     # Finally, on GCE, we need to copy over the user's credentials, in case
     # nodes need to attach persistent disks.
@@ -4094,6 +4047,22 @@ class Djinn
     end
 
     HelperFunctions.scp_file(gce_oauth, gce_oauth, ip, ssh_key)
+  end
+
+  # Logs into the named host and alters its ssh configuration to enable the
+  # root user to directly log in.
+  def enable_root_login(ip, ssh_key, user_name)
+    options = '-o StrictHostkeyChecking=no -o NumberOfPasswordPrompts=0'
+    backup_keys = 'sudo cp -p /root/.ssh/authorized_keys ' +
+        '/root/.ssh/authorized_keys.old'
+    Djinn.log_run("ssh -i #{ssh_key} #{options} 2>&1 #{user_name}@#{ip} " +
+                      "'#{backup_keys}'")
+
+    merge_keys = 'sudo sed -n ' +
+        '"/Please login/d; w/root/.ssh/authorized_keys" ' +
+        "~#{user_name}/.ssh/authorized_keys /root/.ssh/authorized_keys.old"
+    Djinn.log_run("ssh -i #{ssh_key} #{options} 2>&1 #{user_name}@#{ip} " +
+                      "'#{merge_keys}'")
   end
 
   def rsync_files(dest_node)
@@ -4146,7 +4115,7 @@ class Djinn
 
     @nodes.each { |node|
       master_ip = node.private_ip if node.jobs.include?("db_master")
-      if !slave_ips.include? node.private_ip
+      unless slave_ips.include? node.private_ip
         slave_ips << node.private_ip if node.jobs.include?("db_slave")
       end
     }
@@ -4180,14 +4149,13 @@ class Djinn
     HelperFunctions.write_file("#{APPSCALE_CONFIG_DIR}/slaves", "#{slave_ips_newlined}\n")
 
     # Invoke datastore helper function
-    setup_db_config_files(master_ip, slave_ips)
+    setup_db_config_files(master_ip)
 
     update_hosts_info()
 
     # use iptables to lock down outside traffic
     # nodes can talk to each other on any port
     # but only the outside world on certain ports
-    #`iptables --flush`
     if FIREWALL_IS_ON
       Djinn.log_run("bash #{APPSCALE_HOME}/firewall.conf")
     end
@@ -4315,31 +4283,82 @@ HOSTS
   end
 
 
-  # Writes new nginx configuration files for the App Engine applications
-  # hosted in this deployment. Callers should invoke this method whenever
-  # there is a change in the number of machines hosting App Engine apps.
-  def regenerate_nginx_config_files()
-    Djinn.log_debug("Regenerating nginx config files for App Engine apps")
+  # Writes new nginx and haproxy configuration files for the App Engine
+  # applications hosted in this deployment. Callers should invoke this
+  # method whenever there is a change in the number of machines hosting
+  # App Engine apps.
+  def regenerate_routing_config()
+    Djinn.log_debug("Regenerating nginx and haproxy config files for apps.")
     my_public = my_node.public_ip
     my_private = my_node.private_ip
     login_ip = get_login.private_ip
 
-    Djinn.log_debug("@app_info_map is #{@app_info_map.inspect}")
-    @apps_loaded.each { |app|
-      http_port = @app_info_map[app]['nginx']
-      https_port = @app_info_map[app]['nginx_https']
-      proxy_port = @app_info_map[app]['haproxy']
-      Djinn.log_debug("Regenerating nginx config for app #{app}, on http " +
-        "port #{http_port}, https port #{https_port}, and haproxy port " +
-        "#{proxy_port}.")
+    apps_to_check = @apps_loaded
+    apps_to_check.each { |app|
+      next if app == "none"
 
-      static_handlers = HelperFunctions.parse_static_data(app)
-      Nginx.write_fullproxy_app_config(app, http_port, https_port,
-        my_public, my_private, proxy_port, static_handlers, login_ip,
-        @app_info_map[app]['language'])
+      # Check that we have the application information needed to
+      # regenerate the routing configuration.
+      running = false
+      unless (@app_info_map[app].nil? or @app_info_map[app]['nginx'].nil? or
+              @app_info_map[app]['nginx_https'].nil? or
+              @app_info_map[app]['haproxy'].nil? or
+              @app_info_map[app]['appengine'].nil? or
+              @app_info_map[app]['language'].nil?)
+        http_port = @app_info_map[app]['nginx']
+        https_port = @app_info_map[app]['nginx_https']
+        proxy_port = @app_info_map[app]['haproxy']
+        app_language = @app_info_map[app]['language']
+        Djinn.log_debug("Regenerating nginx config for app #{app}, on http " +
+          "port #{http_port}, https port #{https_port}, and haproxy port " +
+          "#{proxy_port}.")
+
+        # Let's see if we already have any AppServers running for this
+        # application.
+        @app_info_map[app]['appengine'].each { |location|
+          host, port = location.split(":")
+          next if Integer(port) < 0
+          running = true
+          break
+        }
+      end
+
+      unless running
+        Djinn.log_debug("Removing routing for #{app} since no appserver is running.")
+        Nginx.remove_app(app)
+        HAProxy.remove_app(app)
+        next
+      end
+
+      begin
+        static_handlers = HelperFunctions.parse_static_data(app)
+      rescue => except
+        # This specific exception may be a JSON parse error.
+        error_msg = "ERROR: Unable to parse app.yaml file for #{app}. "\
+          "Exception of #{except.class} with message #{except.message}"
+        place_error_app(app, error_msg, app_language)
+        static_handlers = []
+      end
+
+      HAProxy.update_app_config(my_private, app, @app_info_map[app])
+
+      # If nginx config files have been updated, we communicate the app's
+      # ports to the UserAppServer to make sure we have the latest info.
+      if Nginx.write_fullproxy_app_config(app, http_port, https_port,
+          my_public, my_private, proxy_port, static_handlers, login_ip,
+          app_language)
+        uac = UserAppClient.new(my_node.private_ip, @@secret)
+        begin
+          if uac.add_instance(app, my_public, http_port, https_port)
+            Djinn.log_info("Committed application info for #{app} " +
+              "to user_app_server")
+          end
+        rescue FailedNodeException
+          Djinn.log_warn("Failed to talk to UAServer to add_instance for #{app}.")
+        end
+      end
     }
-    Djinn.log_debug("Done writing new nginx config files!")
-    Nginx.reload()
+    Djinn.log_debug("Done updating nginx and haproxy config files.")
   end
 
 
@@ -4439,10 +4458,10 @@ HOSTS
     # As per trusty's version of haproxy, we need to have a listening
     # socket for the daemon to start: we do use the uaserver to configured
     # a default route.
-    configure_uaserver
+    configure_uaserver()
 
     # Volume is mounted, let's finish the configuration of static files.
-    if my_node.is_login? and not my_node.is_appengine?
+    if my_node.is_shadow? and not my_node.is_appengine?
       write_app_logrotate()
       Djinn.log_info("Copying logrotate script for centralized app logs")
     end
@@ -4508,15 +4527,14 @@ HOSTS
     }
     start = "/usr/bin/ruby -w /root/appscale/AppController/djinnServer.rb"
     stop = "/usr/sbin/service appscale-controller stop"
-    match_cmd = "/usr/bin/ruby -w /root/appscale/AppController/djinnServer.rb"
 
     # Let's make sure we don't have 2 jobs monitoring the controller.
     FileUtils.rm_rf("/etc/monit/conf.d/controller-17443.cfg")
 
     begin
-      MonitInterface.start(:controller, start, stop, SERVER_PORT, env,
-        match_cmd)
-    rescue => e
+      MonitInterface.start(:controller, start, stop, [SERVER_PORT], env,
+                           start, nil, nil, nil)
+    rescue
       Djinn.log_warn("Failed to set local AppController monit: retrying.")
       retry
     end
@@ -4580,10 +4598,12 @@ HOSTS
   def start_memcache()
     @state = "Starting up memcache"
     Djinn.log_info("Starting up memcache")
-    start_cmd = "/usr/bin/memcached -m 64 -p 11211 -u root"
+    port = 11211
+    start_cmd = "/usr/bin/memcached -m 64 -p #{port} -u root"
     stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
-          "/usr/bin/memcached 11211"
-    MonitInterface.start(:memcached, start_cmd, stop_cmd, [11211])
+          "/usr/bin/memcached #{port}"
+    MonitInterface.start(:memcached, start_cmd, stop_cmd, [port], nil,
+                         start_cmd, nil, nil, nil)
   end
 
   def stop_memcache()
@@ -4604,37 +4624,51 @@ HOSTS
     Ejabberd.stop()
   end
 
-  # Start the AppDashboard web service which allows users to login,
-  # upload and remove apps, and view the status of the AppScale deployment.
-  #
-  # Args:
-  #  login_ip: A string wth the ip of the login node.
-  #  uaserver_ip: A string with the ip of the UserAppServer.
-  def start_app_dashboard(login_ip, uaserver_ip)
-    @state = "Starting AppDashboard"
-    Djinn.log_info("Starting AppDashboard")
+  # Create the system user used to start and run system's applications.
+  def create_appscale_user()
+    uac = UserAppClient.new(my_node.private_ip, @@secret)
+    password = SecureRandom.base64
+    begin
+      result = uac.commit_new_user(APPSCALE_USER, password, "app")
+      Djinn.log_info("Created/confirmed system user: (#{result})")
+    rescue FailedNodeException
+      Djinn.log_warn("Failed to talk to the UserAppServer while committing " +
+        "the system user.")
+    end
+  end
 
-    Thread.new{
-      my_public = my_node.public_ip
-      my_private = my_node.private_ip
+  # Start the AppDashboard web service which allows users to login, upload
+  # and remove apps, and view the status of the AppScale deployment. Other
+  # nodes will need to delete the old source since we regenerate each
+  # 'up'.
+  def prep_app_dashboard()
+    @state = "Preparing AppDashboard"
+    Djinn.log_info("Preparing AppDashboard")
 
-      AppDashboard.start(login_ip, uaserver_ip, my_public, my_private,
-          PERSISTENT_MOUNT_POINT, @@secret)
-      setup_app_dir(AppDashboard::APP_NAME, true)
-      APPS_LOCK.synchronize {
+    my_public = my_node.public_ip
+    my_private = my_node.private_ip
+
+    # Reserve dashboard app ID.
+    result = reserve_app_id(APPSCALE_USER, AppDashboard::APP_NAME,
+      AppDashboard::APP_LANGUAGE, @@secret)
+    Djinn.log_debug("reserve_app_id for dashboard returned: #{result}.")
+
+    # Create and 'upload' the application.
+    AppDashboard.start(my_public, my_private,
+        PERSISTENT_MOUNT_POINT, @@secret)
+
+    # Assign the specific ports to it.
+    APPS_LOCK.synchronize {
+      if @app_info_map[AppDashboard::APP_NAME].nil?
         @app_info_map[AppDashboard::APP_NAME] = {
-            'nginx' => AppDashboard::LISTEN_PORT,
-            'nginx_https' => AppDashboard::LISTEN_SSL_PORT,
-            'haproxy' => AppDashboard::PROXY_PORT,
-            'appengine' => ["#{my_private}:-1", "#{my_private}:-1",
-                            "#{my_private}:-1"],
-            'language' => AppDashboard::APP_LANGUAGE
+          'nginx' => AppDashboard::LISTEN_PORT,
+          'nginx_https' => AppDashboard::LISTEN_SSL_PORT,
+          'haproxy' => AppDashboard::PROXY_PORT,
+          'appengine' => [],
+          'language' => AppDashboard::APP_LANGUAGE
         }
-      }
-
-      Djinn.log_info("Starting cron service for #{AppDashboard::APP_NAME}")
-      CronHelper.update_cron(login_ip, AppDashboard::LISTEN_PORT,
-        AppDashboard::APP_LANGUAGE, AppDashboard::APP_NAME)
+      end
+      @app_names << AppDashboard::APP_NAME
     }
   end
 
@@ -4675,63 +4709,125 @@ HOSTS
   # load balancer, and marks the missing apps for start during the next
   # cycle.
   def starts_new_apps_or_appservers()
-    APPS_LOCK.synchronize {
-      uac = UserAppClient.new(my_node.private_ip, @@secret)
-      Djinn.log_debug("Checking applications that should be running.")
+    uac = UserAppClient.new(my_node.private_ip, @@secret)
+    Djinn.log_debug("Checking applications that should be running.")
+    begin
+      app_list = uac.get_all_apps()
+    rescue FailedNodeException => except
+      Djinn.log_warn("starts_new_apps_or_appservers: failed to get apps (#{except}).")
+      app_list = []
+    end
+    Djinn.log_debug("Apps to check: #{app_list}.") unless app_list.empty?
+    app_list.each { |app|
       begin
-        app_list = uac.get_all_apps()
-      rescue FailedNodeException
-        Djinn.log_warn("Failed to get app listing: retrying.")
-        retry
-      end
-      Djinn.log_debug("Apps to check: #{app_list}.") if !app_list.empty?
-      app_list.each { |app|
+        # If app is not enabled or if we already know of it, we skip it.
+        next if @app_names.include?(app)
         begin
-          # If app is not enabled or if we already know of it, we skip it.
-          next if @app_names.include?(app)
-          next if !uac.is_app_enabled?(app)
-
-          # If we don't have a record for this app, we start it.
-          Djinn.log_info("Adding #{app} to running apps.")
-
-          # We query the UserAppServer looking for application data, in
-          # particular ports and language.
-          result = uac.get_app_data(app)
-          app_data = JSON.load(result)
-          Djinn.log_debug("#{app} metadata: #{app_data}")
-
-          app_language = app_data['language']
-          Djinn.log_info("Restoring app #{app} (language #{app_language})" +
-            " with ports #{app_data['hosts']}.")
-
-          @app_info_map[app] = {} if @app_info_map[app].nil?
-          @app_info_map[app]['language'] = app_language if app_language
-          if app_data['hosts'].values[0]
-            if app_data['hosts'].values[0]['http']
-              @app_info_map[app]['nginx'] = app_data['hosts'].values[0]['http']
-            end
-            if app_data['hosts'].values[0]['https']
-              @app_info_map[app]['nginx_https'] = app_data['hosts'].values[0]['https']
-            end
-          end
-          @app_names = @app_names + [app]
+          next unless uac.is_app_enabled?(app)
         rescue FailedNodeException
-          Djinn.log_warn("Couldn't check if app #{app} exists on #{db_private_ip}")
+          Djinn.log_warn("Failed to talk to the UserAppServer about " +
+            "application #{app}.")
+          next
         end
-      }
-      @app_names.uniq!
 
-      # And now starts applications.
-      @state = "Preparing to run AppEngine apps if needed."
+        # If we don't have a record for this app, we start it.
+        Djinn.log_info("Adding #{app} to running apps.")
 
-      apps_to_load = @app_names - @apps_loaded - ["none"]
-      apps_to_load.each { |app|
-        setup_appengine_application(app)
-        maybe_start_taskqueue_worker(app)
-      }
+        # We query the UserAppServer looking for application data, in
+        # particular ports and language.
+        result = uac.get_app_data(app)
+        app_data = JSON.load(result)
+        Djinn.log_debug("#{app} metadata: #{app_data}")
+
+        app_language = app_data['language']
+        Djinn.log_info("Restoring app #{app} (language #{app_language})" +
+          " with ports #{app_data['hosts']}.")
+
+        @app_info_map[app] = {} if @app_info_map[app].nil?
+        @app_info_map[app]['language'] = app_language if app_language
+        if app_data['hosts'].values[0]
+          if app_data['hosts'].values[0]['http']
+            @app_info_map[app]['nginx'] = app_data['hosts'].values[0]['http']
+          end
+          if app_data['hosts'].values[0]['https']
+            @app_info_map[app]['nginx_https'] = app_data['hosts'].values[0]['https']
+          end
+        end
+        @app_names = @app_names + [app]
+      rescue FailedNodeException
+        Djinn.log_warn("Couldn't check if app #{app} exists on #{db_private_ip}")
+      end
+    }
+    @app_names.uniq!
+
+    # And now starts applications.
+    @state = "Preparing to run AppEngine apps if needed."
+
+    apps_to_load = @app_names - @apps_loaded - ["none"]
+    apps_to_load.each { |app|
+      setup_appengine_application(app)
+      maybe_start_taskqueue_worker(app)
     }
   end
 
+  # This function ensures that applications we are not aware of (that is
+  # they are not accounted for) will be terminated and, potentially old
+  # sources, will be removed.
+  def check_stopped_apps()
+    uac = UserAppClient.new(my_node.private_ip, @@secret)
+    Djinn.log_debug("Checking applications that have been stopped.")
+    app_list = HelperFunctions.get_loaded_apps()
+    app_list.each { |app|
+      next if @app_names.include?(app)
+      next if RESERVED_APPS.include?(app)
+      begin
+        next if uac.is_app_enabled?(app)
+      rescue FailedNodeException
+        Djinn.log_warn("Failed to talk to the UserAppServer about app #{app}.")
+        next
+      end
+
+      Djinn.log_info("#{app} is no longer running: removing old states.")
+
+      if my_node.is_load_balancer?
+        stop_xmpp_for_app(app)
+        Nginx.remove_app(app)
+        HAProxy.remove_app(app)
+      end
+
+      if my_node.is_appengine?
+        Djinn.log_debug("Calling AppManager to stop app #{app}.")
+        app_manager = AppManagerClient.new(my_node.private_ip)
+        begin
+          if app_manager.stop_app(app)
+            Djinn.log_info("Asked AppManager to shut down app #{app}.")
+          else
+            Djinn.log_warn("AppManager is unable to stop app #{app}.")
+          end
+        rescue FailedNodeException
+          Djinn.log_warn("Failed to talk to AppManager about stopping #{app}.")
+        end
+
+        begin
+          ZKInterface.remove_app_entry(app, my_node.public_ip)
+        rescue FailedZooKeeperOperationException => except
+          Djinn.log_warn("check_stopped_apps: got exception talking to " +
+            "zookeeper: #{except.message}.")
+        end
+      end
+
+      if my_node.is_shadow?
+        Djinn.log_info("Removing log configuration for #{app}.")
+        FileUtils.rm_f(get_rsyslog_conf(app))
+        HelperFunctions.shell("service rsyslog restart")
+      end
+
+      Djinn.log_run("rm -rf #{HelperFunctions.get_app_path(app)}")
+      CronHelper.clear_app_crontab(app)
+      maybe_stop_taskqueue_worker(app)
+      Djinn.log_debug("Done cleaning up after stopped application #{app}.")
+    }
+  end
 
   # All nodes will compare the list of AppServers they should be running,
   # with the list of AppServers actually running, and make the necessary
@@ -4745,41 +4841,49 @@ HOSTS
       return
     end
 
+    # Only the shadow runs the application cron jobs.
+    CronHelper.clear_app_crontabs() unless my_node.is_shadow?
+
     to_start = []
     no_appservers = []
     my_apps = []
     to_end = []
-    @app_info_map.each { |app, info|
-      next if not info['appengine']
+    APPS_LOCK.synchronize {
+      @app_info_map.each { |app, info|
+        next unless info['appengine']
 
-      Djinn.log_debug("Checking #{app} with appengine #{info}.")
-      info['appengine'].each { |location|
-        host, port = location.split(":")
-        next if @my_private_ip != host
-
-        if Integer(port) < 0
-          to_start << app
-          no_appservers << app
-        elsif not MonitInterface.is_running?("#{app}-#{port}")
-          Djinn.log_debug("Didn't find the AppServer for #{app} at port #{port}.")
-          if @last_decision[app]
-            if Time.now.to_i - @last_decision[app] > APP_UPLOAD_TIMEOUT * RETRIES
-              Djinn.log_warn("AppServer for #{app} at port #{port} is not running.")
-              to_end << "#{app}:#{port}"
-            end
+        # Update the cron job for the app on the shadow.
+        if my_node.is_shadow?
+          if !info['nginx'].nil? and !info['language'].nil?
+            CronHelper.update_cron(get_load_balancer_ip(),
+              info['nginx'], info['language'], app)
           end
-        else
-          my_apps << "#{app}:#{port}"
         end
+
+        Djinn.log_debug("Checking #{app} with appengine #{info}.")
+        info['appengine'].each { |location|
+          host, port = location.split(":")
+          next if @my_private_ip != host
+
+          if Integer(port) < 0
+            to_start << app
+            no_appservers << app
+          elsif not MonitInterface.is_running?("#{app}-#{port}")
+            Djinn.log_warn("Didn't find the AppServer for #{app} at port #{port}.")
+            to_end << "#{app}:#{port}"
+          else
+            my_apps << "#{app}:#{port}"
+          end
+        }
       }
     }
     # Let's make sure we have the proper list of apps with no currently
     # running AppServers.
     my_apps.each { |appserver|
-      app, port = appserver.split(":")
+      app, _ = appserver.split(":")
       no_appservers.delete(app)
     }
-    Djinn.log_debug("Running AppServers on this node: #{my_apps}.") if !my_apps.empty?
+    Djinn.log_debug("Running AppServers on this node: #{my_apps}.") unless my_apps.empty?
 
     # Check that all the AppServers running are indeed known to the
     # head node.
@@ -4790,7 +4894,7 @@ HOSTS
       # If the app needs to be started, but we have an AppServer not
       # accounted for, we don't take action (ie we wait for headnode
       # state to settle).
-      app, port = appengine.split(":")
+      app, _ = appengine.split(":")
       time_to_delete = true
       if @last_decision[app]
         if Time.now.to_i - @last_decision[app] < APP_UPLOAD_TIMEOUT * RETRIES
@@ -4805,9 +4909,9 @@ HOSTS
         to_end << appengine
       end
     }
-    Djinn.log_debug("First AppServers to start: #{no_appservers}.") if !no_appservers.empty?
-    Djinn.log_debug("AppServers to start: #{to_start}.") if !to_start.empty?
-    Djinn.log_debug("AppServers to terminate: #{to_end}.") if !to_end.empty?
+    Djinn.log_debug("First AppServers to start: #{no_appservers}.") unless no_appservers.empty?
+    Djinn.log_debug("AppServers to start: #{to_start}.") unless to_start.empty?
+    Djinn.log_debug("AppServers to terminate: #{to_end}.") unless to_end.empty?
 
     # Now we do the talking with the appmanagerserver. Since it may take
     # some time to start/stop apps, we do this in a thread. We do one
@@ -4818,36 +4922,57 @@ HOSTS
         Djinn.log_debug("Checking if any app need to be restarted.")
 
         # We restart applications first if needed.
+        apps_to_restart = []
+        app_language = ""
         APPS_LOCK.synchronize {
-          @apps_to_restart.each { |app_name|
-            Djinn.log_info("Got #{app_name} to restart (if applicable).")
+          apps_to_restart = @apps_to_restart
+        }
+
+        apps_to_restart.each { |app_name|
+          Djinn.log_info("Got #{app_name} to restart (if applicable).")
+          APPS_LOCK.synchronize {
+            # Since the AMS can take a long time and we don't hold the
+            # lock here on @apps_to_restart, we do a quick check before
+            # doing the work.
+            next unless @apps_to_restart.include?(app_name)
+
             setup_appengine_application(app_name)
-
-            app_manager = AppManagerClient.new(my_node.private_ip)
-            # TODO: What happens if the user updates their env vars between app
-            # deploys?
-            Djinn.log_info("Restarting AppServers hosting old version of #{app_name}.")
-            begin
-              result = app_manager.restart_app_instances_for_app(app_name,
-                @app_info_map[app_name]['language'])
-            rescue FailedNodeException
-              Djinn.log_warn("Failed to restart app #{app_name}.")
-            end
-            maybe_reload_taskqueue_worker(app_name)
-
-            @apps_to_restart.delete(app_name)
-            Djinn.log_info("Done restarting #{app_name}.")
+            app_language = @app_info_map[app_name]['language']
           }
+
+          app_manager = AppManagerClient.new(my_node.private_ip)
+          # TODO: What happens if the user updates their env vars between app
+          # deploys?
+          Djinn.log_info("Restarting AppServers hosting old version of #{app_name}.")
+          begin
+            result = app_manager.restart_app_instances_for_app(app_name, app_language)
+          rescue FailedNodeException
+            Djinn.log_warn("Failed to talk to app_manager to restart #{app_name}.")
+            result = false
+          end
+          unless result
+            Djinn.log_warn("Failed to restart app #{app_name}.")
+          end
+          maybe_reload_taskqueue_worker(app_name)
+
+          APPS_LOCK.synchronize {
+            @apps_to_restart.delete(app_name)
+          }
+          Djinn.log_info("Done restarting #{app_name}.")
         }
 
         # We then start or terminate AppServers as needed.
         if !no_appservers[0].nil?
-          Djinn.log_info("Starting first AppServer for app: #{no_appservers[0]}.")
-          ret = add_appserver_process(no_appservers[0])
+          app = no_appservers[0]
+          Djinn.log_info("Starting first AppServer for app: #{app}.")
+          ret = add_appserver_process(app, @app_info_map[app]['nginx'],
+            @app_info_map[app]['nginx_https'], @app_info_map[app]['language'])
           Djinn.log_debug("add_appserver_process returned: #{ret}.")
         elsif !to_start[0].nil?
-          Djinn.log_info("Starting AppServer for app: #{to_start[0]}.")
-          ret = add_appserver_process(to_start[0])
+          app = to_start[0]
+          Djinn.log_info("Starting AppServer for app: #{app}.")
+          ret = add_appserver_process(app, @app_info_map[app]['nginx'],
+            @app_info_map[app]['nginx_https'], @app_info_map[app]['language'])
           Djinn.log_debug("add_appserver_process returned: #{ret}.")
         elsif !to_end[0].nil?
           Djinn.log_info("Terminate the following AppServer: #{to_end[0]}.")
@@ -4859,14 +4984,14 @@ HOSTS
     }
   end
 
-  # This functions check the language of the application both in what we
-  # recorded in the metadata and in app_info_map.
+  # This functions returns the language of the application as recorded in
+  # the metadata.
+  # Args
+  #   app: A String naming the application.
   # Returns:
   #   language: returns python27, java, php or go depending on the
-  #       language of the app, or INVALID_REQUEST in case there is a
-  #       discrepancy between the language recorded in the project and the
-  #       one in the uploaded application.
-  def check_app_language(app)
+  #       language of the app
+  def get_app_language(app)
     app_language = ""
 
     # Let's get the application language as we have in the metadata (this
@@ -4885,22 +5010,24 @@ HOSTS
         break
       rescue FailedNodeException
         # Failed to talk to the UserAppServer: let's try again.
+        Djinn.log_debug("Failed to talk to UserAppServer for #{app}.")
       end
       Djinn.log_info("Waiting for app data to have instance info for app named #{app}")
       Kernel.sleep(SMALL_WAIT)
     }
 
-    # If the language of the application changed, we disable the app since
-    # it may cause some datastore corruption. User will have to create a
-    # new ID.
-    if !@app_info_map[app].nil?
-      if @app_info_map[app]['language'] and @app_info_map[app]['language'] != app_language
-        Djinn.log_warn("Application #{app} changed language!")
-        return INVALID_REQUEST
-      end
-    end
-
     return app_language
+  end
+
+  # Small utility function that returns the full path for the rsyslog
+  # configuration for each application.
+  #
+  # Args:
+  #   app: A String containing the application ID.
+  # Returns:
+  #   path: A String with the path to the rsyslog configuration file.
+  def get_rsyslog_conf(app)
+    return "/etc/rsyslog.d/10-#{app}.conf"
   end
 
   # Performs all of the preprocessing needed to start an App Engine application
@@ -4912,18 +5039,9 @@ HOSTS
     @state = "Setting up AppServers for #{app}"
     Djinn.log_debug("setup_appengine_application: got a new app #{app}.")
 
-    my_public = my_node.public_ip
-    my_private = my_node.private_ip
-
     # Let's create an entry for the application if we don't already have it.
     @app_info_map[app] = {} if @app_info_map[app].nil?
-    @app_info_map[app]['language'] = check_app_language(app)
-    if @app_info_map[app]['language'] == INVALID_REQUEST
-      # We shoulnd't be here at all!
-      Djinn.log_error("Failed to get language for #{app}!")
-      stop_app(app, @@secret)
-      return
-    end
+    @app_info_map[app]['language'] = get_app_language(app)
 
     # Use already assigned ports, or otherwise assign new ports to the
     # application.
@@ -4967,7 +5085,7 @@ HOSTS
     proxy_port = @app_info_map[app]['haproxy']
 
     port_file = "#{APPSCALE_CONFIG_DIR}/port-#{app}.txt"
-    if my_node.is_login?
+    if my_node.is_shadow?
       HelperFunctions.write_file(port_file, "#{@app_info_map[app]['nginx']}")
       Djinn.log_debug("App #{app} will be using nginx port #{nginx_port}, " +
         "https port #{https_port}, and haproxy port #{proxy_port}")
@@ -4989,7 +5107,7 @@ HOSTS
       }
 
       # Setup rsyslog to store application logs.
-      app_log_config_file = "/etc/rsyslog.d/10-#{app}.conf"
+      app_log_config_file = get_rsyslog_conf(app)
       begin
         existing_app_log_config = File.open(app_log_config_file, 'r').read()
       rescue Errno::ENOENT
@@ -5005,8 +5123,6 @@ HOSTS
     end
 
     if my_node.is_shadow?
-      CronHelper.update_cron(my_public, nginx_port,
-          @app_info_map[app]['language'], app)
       begin
         start_xmpp_for_app(app, nginx_port, @app_info_map[app]['language'])
       rescue FailedNodeException
@@ -5015,7 +5131,7 @@ HOSTS
     end
 
     @apps_loaded -= ["none"]
-    @apps_loaded << app
+    @apps_loaded << app unless @apps_loaded.include?(app)
   end
 
 
@@ -5071,7 +5187,7 @@ HOSTS
       }
 
       # Check if the port is really available.
-      if !in_use
+      unless in_use
         actually_available = Djinn.log_run("lsof -i:#{possibly_free_port} -sTCP:LISTEN")
         if actually_available.empty?
           Djinn.log_debug("Port #{possibly_free_port} is available for use.")
@@ -5095,6 +5211,7 @@ HOSTS
       return
     end
 
+    faulty_nodes = []
     @nodes.each { |node|
       node_ip = node.private_ip
       next if node_ip == my_node.private_ip
@@ -5119,7 +5236,7 @@ HOSTS
           Djinn.log_debug("The node at #{node_ip} is initialized.")
           next
         end
-      rescue FailedNodeException => except
+      rescue FailedNodeException
         tries -= 1
         if tries > 0
           Djinn.log_debug("node at #{node_ip} not responding: retrying.")
@@ -5128,21 +5245,27 @@ HOSTS
       end
 
       Djinn.log_warn("Node at #{node_ip} is not responsive.")
-      to_terminate = {}
-      @app_info_map.each { |app, info|
-        next if not info['appengine']
-        to_terminate[app] = []
+      faulty_nodes << node_ip
+    }
 
-        info['appengine'].each { |location|
-          host, port = location.split(":")
-          to_terminate[app] << location if node_ip == host
+    APPS_LOCK.synchronize {
+      faulty_nodes.each { |node_ip|
+        to_terminate = {}
+        @app_info_map.each { |app, info|
+          next unless info['appengine']
+          to_terminate[app] = []
+
+          info['appengine'].each { |location|
+            host, _port = location.split(":")
+            to_terminate[app] << location if node_ip == host
+          }
         }
-      }
 
-      to_terminate.each { |app, appservers|
-        appservers.each { |appserver|
-          host, port = appserver.split(":")
-          remove_appserver_from_haproxy(app, host, port, @@secret)
+        to_terminate.each { |app, appservers|
+          appservers.each { |appserver|
+            host, port = appserver.split(":")
+            remove_appserver_from_haproxy(app, host, port, @@secret)
+          }
         }
       }
     }
@@ -5152,25 +5275,23 @@ HOSTS
   # that each application has received as well as the number of requests that
   # are sitting in haproxy's queue, waiting to be served.
   def scale_appservers_within_nodes
-    APPS_LOCK.synchronize {
-      @apps_loaded.each { |app_name|
-        next if app_name == "none"
+    @apps_loaded.each { |app_name|
+      next if app_name == "none"
 
-        initialize_scaling_info_for_app(app_name)
+      initialize_scaling_info_for_app(app_name)
 
-        # Always get scaling info, as that will send this info to the
-        # AppDashboard for users to view.
-        case get_scaling_info_for_app(app_name)
-        when :scale_up
-          Djinn.log_debug("Considering scaling up app #{app_name}.")
-          try_to_scale_up(app_name)
-        when :scale_down
-          Djinn.log_debug("Considering scaling down app #{app_name}.")
-          try_to_scale_down(app_name)
-        else
-          Djinn.log_debug("Not scaling app #{app_name} up or down right now.")
-        end
-      }
+      # Always get scaling info, as that will send this info to the
+      # AppDashboard for users to view.
+      case get_scaling_info_for_app(app_name)
+      when :scale_up
+        Djinn.log_debug("Considering scaling up app #{app_name}.")
+        try_to_scale_up(app_name)
+      when :scale_down
+        Djinn.log_debug("Considering scaling down app #{app_name}.")
+        try_to_scale_down(app_name)
+      else
+        Djinn.log_debug("Not scaling app #{app_name} up or down right now.")
+      end
     }
   end
 
@@ -5188,11 +5309,7 @@ HOSTS
     @current_req_rate[app_name] = 0
     @total_req_rate[app_name] = 0
     @last_sampling_time[app_name] = Time.now.to_i
-
-    if !@last_decision.has_key?(app_name)
-      @last_decision[app_name] = 0
-    end
-
+    (@last_decision[app_name] = 0) unless @last_decision.has_key?(app_name)
     @initialized_apps[app_name] = true
   end
 
@@ -5252,15 +5369,12 @@ HOSTS
   # this method reports whether or not AppServers should be added, removed, or
   # if no changes are needed.
   def get_scaling_info_for_app(app_name, update_dashboard=true)
-    total_requests_seen = 0
-    total_req_in_queue = 0
-    time_requests_were_seen = 0
-
     # Let's make sure we have the minimum number of AppServers running.
     Djinn.log_debug("Evaluating app #{app_name} for scaling.")
-    if @app_info_map[app_name]['appengine'].length < @num_appengines
-       Djinn.log_info("App #{app_name} doesn't have enough AppServers.")
-       @last_decision[app_name] = 0
+    if (@app_info_map[app_name]['appengine'].nil? ||
+        @app_info_map[app_name]['appengine'].length < @num_appengines)
+      Djinn.log_info("App #{app_name} doesn't have enough AppServers.")
+      @last_decision[app_name] = 0
       return :scale_up
     end
 
@@ -5327,7 +5441,7 @@ HOSTS
     if average_request_rate < 0
       Djinn.log_info("Saw negative request rate for app #{app_name}, so " +
         "resetting our haproxy stats for this app.")
-      initialize_scaling_info_for_app(app_name, force=true)
+      initialize_scaling_info_for_app(app_name, true)
       return
     end
 
@@ -5345,7 +5459,7 @@ HOSTS
 
 
   def try_to_scale_up(app_name)
-    if @app_info_map[app_name].nil? or @app_info_map[app_name]['appengine'].nil?
+    if @app_info_map[app_name].nil? || !@app_names.include?(app_name)
       Djinn.log_info("Not scaling up app #{app_name}, since we aren't " +
         "hosting it anymore.")
       return
@@ -5394,7 +5508,7 @@ HOSTS
         }
         Djinn.log_debug("These hosts are running #{app_name}: #{appengine_running}.")
         available_hosts.each { |host, load|
-          if !appengine_running.include?(host)
+          unless appengine_running.include?(host)
             Djinn.log_debug("Prioritizing #{host} to run #{app_name} " +
                 "since it has no running AppServers for it.")
             appserver_to_use = host
@@ -5471,21 +5585,19 @@ HOSTS
 
     if remove_old
       Djinn.log_info("Removing old application version for app: #{app}.")
-      if !my_node.is_login?
-        FileUtils.rm_rf(app_path)
-      else
-        # Force the login node to refresh the applicaiton directory.
+      if my_node.is_shadow?
+        # Force the shadow node to refresh the application directory.
         FileUtils.rm_rf(app_dir)
+      else
+        FileUtils.rm_rf(app_path)
       end
     end
 
     # Let's make sure we have a copy of the tarball of the application. If
     # not, we will get the latest version from another node.
-    if !File.exists?(app_path)
-      FileUtils.rm_rf(app_dir)
-    end
+    FileUtils.rm_rf(app_dir) unless File.exists?(app_path)
 
-    if !File.directory?(app_dir)
+    unless File.directory?(app_dir)
       Djinn.log_info("App untar directory created from scratch.")
       FileUtils.mkdir_p(app_dir)
 
@@ -5495,7 +5607,7 @@ HOSTS
         # since the following code assumes it is present. If it is not there
         # (which can happen if the scp fails on a large app), throw up a dummy
         # app.
-        if !HelperFunctions.app_has_config_file?(app_path)
+        unless HelperFunctions.app_has_config_file?(app_path)
           error_msg = "ERROR: No app.yaml or appengine-web.xml for app: #{app}."
         else
           # Application is good: let's set it up.
@@ -5508,10 +5620,20 @@ HOSTS
       end
     end
 
-    if !error_msg.empty?
+    unless error_msg.empty?
       # Something went wrong: place the error applcation instead.
-      place_error_app(app, error_msg, @app_info_map[app]['language'])
-      @app_info_map[app]['language'] = "python27"
+      place_error_app(app, error_msg, get_app_language(app))
+    else
+      # Make sure we advertize that this node is hosting the app code.
+      RETRIES.downto(0) {
+        result = done_uploading(app, app_path, @@secret)
+        if result.include?("Found #{app} in zookeeper.")
+          Djinn.log_info("This node is now hosting #{app} source (#{result}).")
+          return
+        end
+        Djinn.log_warn("Retrying done_uploading since it failed with: #{result}.")
+        Kernel.sleep(SMALL_WAIT)
+      }
     end
   end
 
@@ -5519,35 +5641,24 @@ HOSTS
   # Starts a new AppServer for the given application.
   #
   # Args:
-  #   app_id: A String naming the application that an additional instance will
+  #   app: A String naming the application that an additional instance will
   #     be added for.
-  #   secret: A String that is used to authenticate the caller.
-  #
+  #   nginx_port: A String or Fixnum that names the port that should be used to
+  #     serve HTTP traffic for this app.
+  #   https_port: A String or Fixnum that names the port that should be used to
+  #     serve HTTPS traffic for this app.
+  #   app_language: A String naming the language of the application.
   # Returns:
   #   A Boolean to indicate if the AppServer was successfully started.
-  def add_appserver_process(app)
+  def add_appserver_process(app, nginx_port, https_port, app_language)
     Djinn.log_info("Received request to add an AppServer for #{app}.")
 
-    if @app_info_map[app].nil? or @app_info_map[app]['language'].nil?
-      Djinn.log_warn "add_appserver_process: #{app} is unknown."
-      return false
-    end
-
-    APPS_LOCK.synchronize {
-      # Make sure we have the application code.
-      setup_app_dir(app)
-    }
-
-    app_language = @app_info_map[app]['language']
-
-    # We use the ports as assigned by the head node.
-    nginx_port = @app_info_map[app]['nginx']
-    https_port = @app_info_map[app]['nginx_https']
-    proxy_port = @app_info_map[app]['haproxy']
+    # Make sure we have the application setup properly.
+    setup_app_dir(app)
 
     # Wait for the head node to be setup for this app.
     port_file = "#{APPSCALE_CONFIG_DIR}/port-#{app}.txt"
-    if !File.exists?(port_file)
+    unless File.exists?(port_file)
       Djinn.log_info("Waiting for port file for app #{app}.")
       return false
     end
@@ -5572,7 +5683,7 @@ HOSTS
         get_load_balancer_ip(), app_language, xmpp_ip,
         HelperFunctions.get_app_env_vars(app),
         Integer(@options['max_memory']), get_login.private_ip)
-    rescue FailedNodeException, ArgumentError => error
+    rescue FailedNodeException, AppScaleException, ArgumentError => error
       Djinn.log_warn("#{error.class} encountered while starting #{app} "\
         "with AppManager: #{error.message}")
       pid = -1
@@ -5625,7 +5736,7 @@ HOSTS
         "stop instance on port #{port} for application #{app_id}.")
       result = false
     end
-    if !result
+    unless result
       Djinn.log_error("Unable to stop instance on port #{port} " +
         "application #{app_id}")
     end
@@ -5679,7 +5790,9 @@ HOSTS
 
 
   def scale_appservers_across_nodes()
-    return if !my_node.is_login?
+    # Only the shadow makes scaling decisions.
+    return unless my_node.is_shadow?
+
     # TODO: Do we need to get the apps lock here?
     Djinn.log_debug("Seeing if we need to spawn new AppServer nodes")
 
@@ -5698,7 +5811,6 @@ HOSTS
       scale_up_requests = scaling_requests.select { |item| item == "scale_up" }
       num_of_scale_up_requests = scale_up_requests.length
 
-      # Spawn an additional node if the login node requests it.
       if num_of_scale_up_requests > 0
         Djinn.log_debug("Login node is requesting more AppServers for app " +
           "#{appid}, so adding a node.")
@@ -5729,7 +5841,6 @@ HOSTS
       return 0
     end
 
-    regenerate_nginx_config_files()
     @last_scaling_time = Time.now.to_i
     return nodes_needed.length
   end
@@ -5748,7 +5859,7 @@ HOSTS
   #   removed from this AppScale deployment.
   def examine_scale_down_requests(all_scaling_votes)
     # First, only scale down in cloud environments.
-    if !is_cloud?
+    unless is_cloud?
       Djinn.log_debug("Not scaling down VMs, because we aren't in a cloud.")
       return 0
     end
@@ -5781,7 +5892,7 @@ HOSTS
       end
     }
 
-    if !scale_down_threshold_reached
+    unless scale_down_threshold_reached
       Djinn.log_debug("Not scaling down VMs right now, as not enough nodes have " +
         "requested it.")
       return 0
@@ -5810,7 +5921,6 @@ HOSTS
       return 0
     end
 
-    remove_app_hosting_data_for_node(node_to_remove.public_ip)
     remove_node_from_local_and_zookeeper(node_to_remove.public_ip)
 
     @app_info_map.each { |app_id, info|
@@ -5833,7 +5943,7 @@ HOSTS
     rescue FailedNodeException
       Djinn.log_warn("Failed to call terminate_instances")
     end
-    regenerate_nginx_config_files()
+
     @last_scaling_time = Time.now.to_i
     return -1
   end
@@ -5866,7 +5976,7 @@ HOSTS
     retries_left = 10
     loop {
       nodes_with_app = ZKInterface.get_app_hosters(appname, @options['keyname'])
-      break if !nodes_with_app.empty?
+      break unless nodes_with_app.empty?
       Djinn.log_info("[#{retries_left} retries left] Waiting for a node to " +
         "have a copy of app #{appname}")
       Kernel.sleep(SMALL_WAIT)
@@ -5877,7 +5987,8 @@ HOSTS
       end
     }
 
-    # Try 3 times on each node known to have this application
+    # Try 3 times on each node known to have this application. Make sure
+    # we pick a random order to not overload the same host.
     nodes_with_app.each { |node|
       ssh_key = node.ssh_key
       ip = node.private_ip
@@ -5886,8 +5997,7 @@ HOSTS
         Djinn.log_debug("Trying #{ip}:#{app_path} for the application.")
         Djinn.log_run("scp -o StrictHostkeyChecking=no -i #{ssh_key} #{ip}:#{app_path} #{app_path}")
         if File.exists?(app_path)
-          done_uploading(appname, app_path, @@secret)
-          Djinn.log_debug("Got a copy of #{appname} from #{ip}.")
+          Djinn.log_info("Got a copy of #{appname} from #{ip}.")
           return true
         end
         Djinn.log_warn("Unable to get the application from #{ip}:#{app_path}! scp failed.")
@@ -5936,7 +6046,8 @@ HOSTS
       start_cmd = "#{PYTHON27} #{APPSCALE_HOME}/XMPPReceiver/xmpp_receiver.py #{app} #{login_ip} #{@@secret}"
       stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
         "xmpp_receiver.py #{app}"
-      MonitInterface.start(watch_name, start_cmd, stop_cmd, 9999)
+      MonitInterface.start(watch_name, start_cmd, stop_cmd, [9999], nil,
+                           start_cmd, nil, nil, nil)
       Djinn.log_debug("App #{app} does need xmpp receive functionality")
     else
       Djinn.log_debug("App #{app} does not need xmpp receive functionality")
@@ -5969,9 +6080,7 @@ HOSTS
   #   A hash in string format containing system and platform stats for this
   #     node.
   def get_all_stats(secret)
-    if !valid_secret?(secret)
-      return BAD_SECRET_MSG
-    end
+    return BAD_SECRET_MSG unless valid_secret?(secret)
 
     # Get stats from SystemManager.
     imc = InfrastructureManagerClient.new(secret)
@@ -5981,44 +6090,51 @@ HOSTS
     # Combine all useful stats and return.
     all_stats = system_stats
     all_stats["apps"] = {}
-    if my_node.is_login? and !app_info_map.nil?
-      @apps_loaded.each { |app_name|
-        next if app_name == "none"
-
-        # Get HAProxy requests.
-        Djinn.log_debug("Getting HAProxy stats for app: #{app_name}")
-        total_reqs, reqs_enqueued, collection_time = get_haproxy_stats(app_name)
-        # Create the apps hash with useful information containing HAProxy stats.
-        begin
-          appservers = 0
-          pending = 0
-          if collection_time == :no_backend
-            total_reqs = 0
-            reqs_enqueued = 0
-          else
-            @app_info_map[app_name]['appengine'].each{ |location|
-              host, port = location.split(":")
-              if Integer(port) > 0
-                appservers += 1
-              else
-                pending += 1
-              end
-            }
+    if my_node.is_shadow?
+      APPS_LOCK.synchronize {
+        @apps_loaded.each { |app_name|
+          next if app_name == "none"
+          if @app_info_map[app_name].nil? or @app_info_map[app_name]['appengine'].nil?
+            Djinn.log_debug("#{app_name} not setup yet: skipping getting stats.")
+            next
           end
-          all_stats["apps"][app_name] = {
-            "language" => @app_info_map[app_name]["language"].tr('^A-Za-z', ''),
-            "appservers" => appservers,
-            "pending_appservers" => pending,
-            "http" => @app_info_map[app_name]["nginx"],
-            "https" => @app_info_map[app_name]["nginx_https"],
-            "total_reqs" => total_reqs,
-            "reqs_enqueued" => reqs_enqueued
-          }
-        rescue => exception
-          backtrace = exception.backtrace.join("\n")
-          message = "Unforseen exception: #{exception} \nBacktrace: #{backtrace}"
-          Djinn.log_warn("Unable to get application stats: #{message}")
-        end
+
+          # Get HAProxy requests.
+          Djinn.log_debug("Getting HAProxy stats for app: #{app_name}")
+          total_reqs, reqs_enqueued, collection_time = get_haproxy_stats(app_name)
+          # Create the apps hash with useful information containing HAProxy stats.
+          begin
+            appservers = 0
+            pending = 0
+            if collection_time == :no_backend
+              total_reqs = 0
+              reqs_enqueued = 0
+            else
+
+              @app_info_map[app_name]['appengine'].each{ |location|
+                host, port = location.split(":")
+                if Integer(port) > 0
+                  appservers += 1
+                else
+                  pending += 1
+                end
+              }
+            end
+            all_stats["apps"][app_name] = {
+              "language" => @app_info_map[app_name]["language"].tr('^A-Za-z', ''),
+              "appservers" => appservers,
+              "pending_appservers" => pending,
+              "http" => @app_info_map[app_name]["nginx"],
+              "https" => @app_info_map[app_name]["nginx_https"],
+              "total_reqs" => total_reqs,
+              "reqs_enqueued" => reqs_enqueued
+            }
+          rescue => exception
+            backtrace = exception.backtrace.join("\n")
+            message = "Unforseen exception: #{exception} \nBacktrace: #{backtrace}"
+            Djinn.log_warn("Unable to get application stats: #{message}")
+          end
+        }
       }
     end
 

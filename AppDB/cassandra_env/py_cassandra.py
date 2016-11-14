@@ -2,10 +2,12 @@
 Cassandra Interface for AppScale
 """
 import cassandra
+import dbconstants
 import os
 import sys
 import time
 
+from dbconstants import AppScaleDBConnectionError
 from dbconstants import SCHEMA_TABLE
 from dbconstants import SCHEMA_TABLE_SCHEMA
 from dbinterface import AppDBInterface
@@ -35,8 +37,7 @@ class DatastoreProxy(AppDBInterface):
     remaining_retries = INITIAL_CONNECT_RETRIES
     while True:
       try:
-        # Cassandra 2.1 only supports up to Protocol Version 3.
-        cluster = Cluster(hosts, protocol_version=3)
+        cluster = Cluster(hosts)
         self.session = cluster.connect(keyspace=KEYSPACE)
         break
       except cassandra.cluster.NoHostAvailable as connection_error:
@@ -64,10 +65,8 @@ class DatastoreProxy(AppDBInterface):
                   'columns': ValueSequence(column_names)}
     try:
       results = self.session.execute(query, parameters)
-    except (cassandra.Unavailable, cassandra.Timeout,
-            cassandra.CoordinationFailure, cassandra.OperationTimedOut):
-      list[0] += 'Unable to fetch entity'
-      return list
+    except dbconstants.TRANSIENT_CASSANDRA_ERRORS:
+      raise AppScaleDBConnectionError('Unable to fetch entity')
 
     results_dict = {}
     for (_, column, value) in results:
@@ -106,8 +105,7 @@ class DatastoreProxy(AppDBInterface):
 
     try:
       self.session.execute(batch)
-    except (cassandra.Unavailable, cassandra.Timeout,
-            cassandra.CoordinationFailure, cassandra.OperationTimedOut):
+    except dbconstants.TRANSIENT_CASSANDRA_ERRORS:
       list[0] += 'Unable to insert entity'
       return list
 
@@ -135,8 +133,7 @@ class DatastoreProxy(AppDBInterface):
 
     try:
       results = self.session.execute(query)
-    except (cassandra.Unavailable, cassandra.Timeout,
-            cassandra.CoordinationFailure, cassandra.OperationTimedOut):
+    except dbconstants.TRANSIENT_CASSANDRA_ERRORS:
       response[0] += 'Unable to fetch table contents'
       return response
 
@@ -175,8 +172,7 @@ class DatastoreProxy(AppDBInterface):
 
     try:
       self.session.execute(delete, (row_key,))
-    except (cassandra.Unavailable, cassandra.Timeout,
-            cassandra.CoordinationFailure, cassandra.OperationTimedOut):
+    except dbconstants.TRANSIENT_CASSANDRA_ERRORS:
       response[0] += 'Unable to delete row'
       return response
 

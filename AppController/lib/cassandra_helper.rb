@@ -7,7 +7,7 @@ require 'monit_interface'
 
 # A String that indicates where we write the process ID that Cassandra runs
 # on at this machine.
-PID_FILE = "/var/appscale/appscale-cassandra.pid"
+PID_FILE = "/tmp/appscale-cassandra.pid"
 
 
 # A String that indicates where we install Cassandra on this machine.
@@ -35,6 +35,14 @@ NODETOOL = "#{CASSANDRA_DIR}/cassandra/bin/nodetool"
 PRIME_SCRIPT = "#{CASSANDRA_ENV_DIR}/prime_cassandra.py"
 
 
+# The number of seconds Monit should allow Cassandra to take while starting up.
+START_TIMEOUT = 60
+
+
+# The location of the Cassandra data directory.
+CASSANDRA_DATA_DIR = "/opt/appscale/cassandra"
+
+
 # Determines if a UserAppServer should run on this machine.
 #
 # Args:
@@ -51,45 +59,16 @@ def has_soap_server?(job)
 end
 
 
-# Calculates the token that should be set on this machine, which dictates how
-# data should be partitioned between machines.
-#
-# Args:
-#   master_ip: A String corresponding to the private FQDN or IP address of the
-#     machine hosting the Database Master role.
-#   slave_ips: An Array of Strings, where each String corresponds to a private
-#     FQDN or IP address of a machine hosting a Database Slave role.
-# Returns:
-#   A Fixnum that corresponds to the token that should be used on this machine's
-#   Cassandra configuration.
-def get_local_token(master_ip, slave_ips)
-  return if master_ip == HelperFunctions.local_ip
-
-  slave_ips.each_with_index { |ip, index|
-    # This token generation was taken from:
-    # http://www.datastax.com/docs/0.8/install/cluster_init#cluster-init
-    if ip == HelperFunctions.local_ip
-      # Add one to offset the master
-      return (index + 1)*(2**127)/(1 + slave_ips.length)
-    end
-  }
-end
-
-
 # Writes all the configuration files necessary to start Cassandra on this
 # machine.
 #
 # Args:
 #   master_ip: A String corresponding to the private FQDN or IP address of the
 #     machine hosting the Database Master role.
-#   slave_ips: An Array of Strings, where each String corresponds to a private
-#     FQDN or IP address of a machine hosting a Database Slave role.
-def setup_db_config_files(master_ip, slave_ips)
-  local_token = get_local_token(master_ip, slave_ips)
+def setup_db_config_files(master_ip)
   local_ip = HelperFunctions.local_ip
   setup_script = "#{SETUP_CONFIG_SCRIPT} --local-ip #{local_ip} "\
                  "--master-ip #{master_ip}"
-  setup_script << " --local-token #{local_token}" unless local_token.nil?
   Djinn.log_run(setup_script)
 end
 
@@ -101,8 +80,8 @@ end
 #   clear_datastore: Remove any pre-existent data in the database.
 #   needed: The number of nodes required for quorum.
 def start_db_master(clear_datastore, needed)
-  @state = "Starting up Cassandra on the head node"
-  Djinn.log_info("Starting up Cassandra as master")
+  @state = "Starting up Cassandra seed node"
+  Djinn.log_info(@state)
   start_cassandra(clear_datastore, needed)
 end
 
@@ -115,8 +94,20 @@ end
 #   clear_datastore: Remove any pre-existent data in the database.
 #   needed: The number of nodes required for quorum.
 def start_db_slave(clear_datastore, needed)
-  @state = "Waiting for Cassandra to come up"
-  Djinn.log_info("Starting up Cassandra as slave")
+  seed_node = get_db_master.private_ip
+  @state = "Waiting for Cassandra seed node at #{seed_node} to start"
+  Djinn.log_info(@state)
+  acc = AppControllerClient.new(seed_node, HelperFunctions.get_secret())
+  while true
+    begin
+      break if acc.primary_db_is_up() == "true"
+    rescue FailedNodeException
+      Djinn.log_warn(
+          "Failed to check if Cassandra is up at #{seed_node}")
+    end
+    sleep(SMALL_WAIT)
+  end
+
   start_cassandra(clear_datastore, needed)
 end
 
@@ -127,22 +118,23 @@ end
 #   clear_datastore: Remove any pre-existent data in the database.
 #   needed: The number of nodes required for quorum.
 def start_cassandra(clear_datastore, needed)
-  Djinn.log_run("pkill ThriftBroker")
   if clear_datastore
     Djinn.log_info("Erasing datastore contents")
-    Djinn.log_run("rm -rf /opt/appscale/cassandra*")
-    Djinn.log_run("rm /var/log/appscale/cassandra/system.log")
+    Djinn.log_run("rm -rf #{CASSANDRA_DATA_DIR}")
   end
 
-  # TODO: Consider a more graceful stop command than this, which does a kill -9.
-  start_cmd = "#{CASSANDRA_EXECUTABLE} start -p #{PID_FILE}"
-  stop_cmd = "/usr/bin/python2 #{APPSCALE_HOME}/scripts/stop_service.py java cassandra"
-  match_cmd = "/opt/cassandra"
-  MonitInterface.start(:cassandra, start_cmd, stop_cmd, ports=9999, env_vars=nil,
-    match_cmd=match_cmd)
+  # Create Cassandra data directory.
+  Djinn.log_run("mkdir -p #{CASSANDRA_DATA_DIR}")
+  Djinn.log_run("chown -R cassandra #{CASSANDRA_DATA_DIR}")
+
+  start_cmd = %Q[su -c "#{CASSANDRA_EXECUTABLE} -p #{PID_FILE}" cassandra]
+  stop_cmd = "/bin/bash -c 'kill $(cat #{PID_FILE})'"
+  MonitInterface.start(:cassandra, start_cmd, stop_cmd, [9999], nil, nil, nil,
+                       PID_FILE, START_TIMEOUT)
 
   # Ensure enough Cassandra nodes are available.
-  sleep(SMALL_WAIT) until system("#{NODETOOL} status")
+  Djinn.log_info('Waiting for Cassandra to start')
+  sleep(SMALL_WAIT) until system("#{NODETOOL} status > /dev/null 2>&1")
   while true
     output = `"#{NODETOOL}" status`
     nodes_ready = 0

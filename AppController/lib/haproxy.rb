@@ -58,8 +58,8 @@ module HAProxy
     start_cmd = "/usr/sbin/service haproxy start"
     stop_cmd = "/usr/sbin/service haproxy stop"
     match_cmd = "/usr/sbin/haproxy"
-    MonitInterface.start(:haproxy, start_cmd, stop_cmd, ports=9999,
-      env_vars=nil, match_cmd=match_cmd)
+    MonitInterface.start(:haproxy, start_cmd, stop_cmd, [9999], nil, match_cmd,
+                         nil, nil, nil)
   end
 
   def self.stop()
@@ -89,6 +89,16 @@ module HAProxy
       servers << {'ip' => server, 'port' => UserAppClient::SERVER_PORT }
     }
     self.create_app_config(servers, my_ip, listen_port, UserAppClient::NAME)
+  end
+
+  # Create the config file for TaskQueue REST API endpoints.
+  def self.create_tq_endpoint_config(server_ips, my_ip, listen_port)
+    servers = []
+    server_ips.each{ |server|
+      servers << {'ip' => server,
+                  'port' => TaskQueue::TASKQUEUE_SERVER_INTERNAL_PORT}
+    }
+    self.create_app_config(servers, my_ip, listen_port, TaskQueue::NAME)
   end
 
   # Create the config file for Datastore Server.
@@ -197,9 +207,17 @@ module HAProxy
 
     config_path = File.join(SITES_ENABLED_PATH,
       "#{full_app_name}.#{CONFIG_EXTENSION}")
-    File.open(config_path, "w+") { |dest_file| dest_file.write(config) }
 
-    HAProxy.regenerate_config()
+    # Let's reload and overwrite only if something changed.
+    current = ""
+    current = File.read(config_path) if File.exists?(config_path)
+    if current != config
+      File.open(config_path, "w+") { |dest_file| dest_file.write(config) }
+      HAProxy.regenerate_config()
+    end
+
+    Djinn.log_debug("No need to restart haproxy: configuration didn't change.")
+    return true
   end
 
 

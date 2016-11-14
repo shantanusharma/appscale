@@ -119,7 +119,7 @@ class ZKInterface
         @@zk.close!
       end
       Djinn.log_debug("Opening connection to zookeeper at #{ip}.")
-      @@zk = Zookeeper.new("#{ip}:#{SERVER_PORT}", timeout=TIMEOUT)
+      @@zk = Zookeeper.new("#{ip}:#{SERVER_PORT}", TIMEOUT)
     }
   end
 
@@ -130,9 +130,7 @@ class ZKInterface
   #   server.
   def self.is_connected?()
     ret = false
-    if defined?(@@zk)
-      ret = @@zk.connected?
-    end
+    ret = @@zk.connected?  if defined?(@@zk)
     Djinn.log_debug("Connection status with zookeeper server: #{ret}.")
     return ret
   end
@@ -184,9 +182,7 @@ class ZKInterface
   #   appname: A String corresponding to the appid of the app whose hosting
   #     data we want to erase.
   def self.clear_app_hosters(appname)
-    if !defined?(@@zk)
-      return
-    end
+    return unless defined?(@@zk)
 
     appname_path = ROOT_APP_PATH + "/#{appname}"
     app_hosters = self.get_children(appname_path)
@@ -509,38 +505,6 @@ class ZKInterface
   end
 
 
-  # Returns an Array of Hashes that correspond to the App Engine applications
-  # hosted on the given ip address. Each hash contains the application's name,
-  # the IP address (which should be the same as the given IP), and the nginx
-  # port that the app is hosted on.
-  def self.get_app_instances_for_ip(ip)
-    app_instance_file = "#{APPCONTROLLER_NODE_PATH}/#{ip}/#{APP_INSTANCE}"
-    if !self.exists?(app_instance_file)
-      return []
-    end
-
-    json_instances = self.get(app_instance_file)
-    return JSON.load(json_instances)
-  end
-
-
-  # Adds an entry to ZooKeeper for the given IP, storing information about the
-  # Google App engine application it is hosting that can be used to update the
-  # AppDashboard should that node fail.
-  def self.add_app_instance(app_name, ip, port)
-    app_instance_file = "#{APPCONTROLLER_NODE_PATH}/#{ip}/#{APP_INSTANCE}"
-    if self.exists?(app_instance_file)
-      json_instances = self.get(app_instance_file)
-      instances = JSON.load(json_instances)
-    else
-      instances = []
-    end
-
-    instances << {'app_name' => app_name, 'ip' => ip, 'port' => port}
-    self.set(app_instance_file, JSON.dump(instances), NOT_EPHEMERAL)
-  end
-
-
   def self.get_job_data_for_ip(ip)
     return JSON.load(self.get("#{APPCONTROLLER_NODE_PATH}/#{ip}/job_data"))
   end
@@ -692,6 +656,11 @@ class ZKInterface
 
 
   def self.exists?(key)
+    unless defined?(@@zk)
+      raise FailedZooKeeperOperationException.new("ZKinterface has not " +
+        "been initialized yet.")
+    end
+
     return self.run_zookeeper_operation {
       @@zk.get(:path => key)[:stat].exists
     }
@@ -699,6 +668,11 @@ class ZKInterface
 
 
   def self.get(key)
+    unless defined?(@@zk)
+      raise FailedZooKeeperOperationException.new("ZKinterface has not " +
+        "been initialized yet.")
+    end
+
     info = self.run_zookeeper_operation {
       @@zk.get(:path => key)
     }
@@ -712,6 +686,11 @@ class ZKInterface
 
 
   def self.get_children(key)
+    unless defined?(@@zk)
+      raise FailedZooKeeperOperationException.new("ZKinterface has not " +
+        "been initialized yet.")
+    end
+
     children = self.run_zookeeper_operation {
       @@zk.get_children(:path => key)[:children]
     }
@@ -725,6 +704,11 @@ class ZKInterface
 
 
   def self.set(key, val, ephemeral)
+    unless defined?(@@zk)
+      raise FailedZooKeeperOperationException.new("ZKinterface has not " +
+        "been initialized yet.")
+    end
+
     retries_left = 5
     begin
       info = {}
@@ -779,6 +763,11 @@ class ZKInterface
 
 
   def self.delete(key)
+    unless defined?(@@zk)
+      raise FailedZooKeeperOperationException.new("ZKinterface has not " +
+        "been initialized yet.")
+    end
+
     info = self.run_zookeeper_operation {
       @@zk.delete(:path => key)
     }
