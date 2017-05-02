@@ -488,10 +488,6 @@ class Djinn
   LOG_FILE = "/var/log/appscale/controller-17443.log"
 
 
-  # Where to put the pid of the controller.
-  PID_FILE = "/var/run/appscale-controller.pid"
-
-
   # Default memory to allocate to each AppServer.
   DEFAULT_MEMORY = 400
 
@@ -2027,9 +2023,6 @@ class Djinn
 
     Djinn.log_info("==== Starting AppController (pid: #{Process.pid}) ====")
 
-    # This pid is used to control this deployment using the init script.
-    HelperFunctions.write_file(PID_FILE, "#{Process.pid}")
-
     # We reload our old IPs (if we find them) so we can check later if
     # they changed and act accordingly.
     begin
@@ -3007,7 +3000,9 @@ class Djinn
     }
     HAProxy.create_ua_server_config(all_db_private_ips,
       my_node.private_ip, UserAppClient::HAPROXY_SERVER_PORT)
-    Nginx.create_uaserver_config(my_node.private_ip)
+    Nginx.create_service_config(
+      'appscale-uaserver', my_node.private_ip,
+      UserAppClient::HAPROXY_SERVER_PORT, UserAppClient::SSL_SERVER_PORT)
   end
 
   def configure_db_haproxy()
@@ -3038,7 +3033,10 @@ class Djinn
 
     # TaskQueue REST API routing.
     # We don't need Nginx for backend TaskQueue servers, only for REST support.
-    Nginx.create_taskqueue_rest_config(my_node.private_ip)
+    rest_prefix = '~ /taskqueue/v1beta2/projects/.*'
+    Nginx.create_service_config(
+      'appscale-taskqueue', my_node.private_ip, TaskQueue::HAPROXY_PORT,
+      TaskQueue::TASKQUEUE_SERVER_SSL_PORT, rest_prefix)
   end
 
   def remove_tq_endpoints
@@ -3636,6 +3634,14 @@ class Djinn
       stop_backup_service
     end
 
+    if my_node.is_shadow?
+      threads << Thread.new {
+        start_admin_server
+      }
+    else
+      stop_admin_server
+    end
+
     if my_node.is_memcache?
       threads << Thread.new {
         start_memcache
@@ -3901,7 +3907,7 @@ class Djinn
 
   # Starts the Log Server service on this machine
   def start_log_server
-    log_server_pid = "/var/run/appscale-logserver.pid"
+    log_server_pid = '/var/run/appscale/log_service.pid'
     log_server_file = "/var/log/appscale/log_service.log"
     start_cmd = "twistd --pidfile=#{log_server_pid}  --logfile " +
                 "#{log_server_file} appscale-logserver"
@@ -4668,15 +4674,17 @@ HOSTS
       'EC2_HOME' => ENV['EC2_HOME'],
       'JAVA_HOME' => ENV['JAVA_HOME']
     }
-    start = "/usr/bin/ruby -w /root/appscale/AppController/djinnServer.rb"
-    stop = "/usr/sbin/service appscale-controller stop"
+    service = `which service`.chomp
+    start_cmd = "#{service} appscale-controller start"
+    stop_cmd = "#{service} appscale-controller stop"
+    pidfile = '/var/run/appscale/controller.pid'
 
     # Let's make sure we don't have 2 jobs monitoring the controller.
     FileUtils.rm_rf("/etc/monit/conf.d/controller-17443.cfg")
 
     begin
-      MonitInterface.start(:controller, start, stop, nil, env,
-                           start, nil, nil, nil)
+      MonitInterface.start(:controller, start_cmd, stop_cmd, nil, env,
+                           nil, nil, pidfile, nil)
     rescue
       Djinn.log_warn("Failed to set local AppController monit: retrying.")
       retry
@@ -4736,6 +4744,25 @@ HOSTS
       HelperFunctions.log_and_crash(@state, WAIT_TO_CRASH)
     end
     Djinn.log_info("Parameters set on node at #{ip} returned #{result}.")
+  end
+
+  def start_admin_server
+    Djinn.log_info('Starting AdminServer')
+    script = `which appscale-admin`.chomp
+    nginx_port = 17441
+    service_port = 17442
+    start_cmd = "/usr/bin/python2 #{script} -p #{service_port}"
+    start_cmd << ' --verbose' if @options['verbose'].downcase == 'true'
+    stop_cmd = "/usr/bin/python2 #{APPSCALE_HOME}/scripts/stop_service.py " +
+      "#{script} #{service_port}"
+    MonitInterface.start(:admin_server, start_cmd, stop_cmd, nil, nil,
+                         start_cmd, nil, nil, nil)
+    Nginx.create_service_config('appscale-admin', my_node.private_ip,
+                                service_port, nginx_port)
+  end
+
+  def stop_admin_server
+    MonitInterface.stop(:admin_server)
   end
 
   def start_memcache()
