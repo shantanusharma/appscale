@@ -876,7 +876,6 @@ class Djinn
         msg = "Error: node layout is missing information #{node}."
         Djinn.log_error(msg)
         raise AppScaleException.new(msg)
-        return msg
       elsif node['public_ip'].empty? || node['private_ip'].empty? ||
          node['jobs'].empty? || node['instance_id'].empty?
         msg = "Error: node layout is missing information #{node}."
@@ -1156,7 +1155,7 @@ class Djinn
         HelperFunctions.scp_file(archived_file, remote_file,
                                  get_shadow.private_ip, get_shadow.ssh_key)
         return acc.upload_app(remote_file, file_suffix, email)
-      rescue FailedNodeException => except
+      rescue FailedNodeException
         Djinn.log_warn("Failed to forward upload_app call to shadow (#{get_shadow}).")
         return NOT_READY
       end
@@ -2352,16 +2351,13 @@ class Djinn
   def start_infrastructure_manager()
     iaas_script = "#{APPSCALE_HOME}/InfrastructureManager/infrastructure_manager_service.py"
     start_cmd = "#{PYTHON27} #{iaas_script}"
-    stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
-          "#{iaas_script} #{PYTHON27}"
     env = {
       'APPSCALE_HOME' => APPSCALE_HOME,
       'EC2_HOME' => ENV['EC2_HOME'],
       'JAVA_HOME' => ENV['JAVA_HOME']
     }
 
-    MonitInterface.start(:iaas_manager, start_cmd, stop_cmd, nil, env,
-                         start_cmd, nil, nil, nil)
+    MonitInterface.start(:iaas_manager, start_cmd, nil, env)
     Djinn.log_info("Started InfrastructureManager successfully!")
   end
 
@@ -3014,8 +3010,8 @@ class Djinn
         end
       }
     }
-    HAProxy.create_datastore_server_config(
-      all_db_private_ips, my_node.private_ip, DatastoreServer::PROXY_PORT)
+    HAProxy.create_datastore_server_config(all_db_private_ips,
+      DatastoreServer::PROXY_PORT)
   end
 
   # Creates HAProxy configuration for TaskQueue.
@@ -3823,13 +3819,9 @@ class Djinn
   # starting and stopping applications.
   def start_app_manager_server()
     @state = "Starting up AppManager"
-    env_vars = {}
     app_manager_script = "#{APPSCALE_HOME}/AppManager/app_manager_server.py"
     start_cmd = "#{PYTHON27} #{app_manager_script}"
-    stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
-          "#{app_manager_script} #{PYTHON27}"
-    MonitInterface.start(:appmanagerserver, start_cmd, stop_cmd, nil,
-                         env_vars, start_cmd, nil, nil, nil)
+    MonitInterface.start(:appmanagerserver, start_cmd)
   end
 
   # Starts the Hermes service on this node.
@@ -3879,10 +3871,7 @@ class Djinn
 
     soap_script = `which appscale-uaserver`.chomp
     start_cmd = "#{soap_script} -t #{table}"
-    stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
-          "#{soap_script} /usr/bin/python"
-    MonitInterface.start(:uaserver, start_cmd, stop_cmd, nil, env_vars,
-                         start_cmd, nil, nil, nil)
+    MonitInterface.start(:uaserver, start_cmd, nil, env_vars)
   end
 
   def start_datastore_server
@@ -3908,17 +3897,24 @@ class Djinn
   # Starts the Log Server service on this machine
   def start_log_server
     log_server_pid = '/var/run/appscale/log_service.pid'
-    log_server_file = "/var/log/appscale/log_service.log"
-    start_cmd = "twistd --pidfile=#{log_server_pid}  --logfile " +
-                "#{log_server_file} appscale-logserver"
-    stop_cmd = "/bin/bash -c 'kill $(cat #{log_server_pid})'"
-    env = {
-        'APPSCALE_HOME' => APPSCALE_HOME,
-        'PYTHONPATH' => "#{APPSCALE_HOME}/LogService/"
-    }
+    log_server_file = '/var/log/appscale/log_service.log'
+    twistd = `which twistd`.chomp
+    env = `which env`.chomp
+    bash = `which bash`.chomp
 
-    MonitInterface.start(:log_service, start_cmd, stop_cmd, nil, env,
-                         nil, nil, log_server_pid, nil)
+    env_vars = {
+      'APPSCALE_HOME' => APPSCALE_HOME,
+      'PYTHONPATH' => "#{APPSCALE_HOME}/LogService/"
+    }
+    start_cmd = [env, env_vars.map{ |k, v| "#{k}=#{v}" }.join(' '),
+                 twistd,
+                 '--pidfile', log_server_pid,
+                 '--logfile', log_server_file,
+                 'appscale-logserver'].join(' ')
+    stop_cmd = "#{bash} -c 'kill $(cat #{log_server_pid})'"
+
+    MonitInterface.start_daemon(:log_service, start_cmd, stop_cmd,
+                                log_server_pid)
     Djinn.log_info("Started Log Server successfully!")
   end
 
@@ -4683,8 +4679,7 @@ HOSTS
     FileUtils.rm_rf("/etc/monit/conf.d/controller-17443.cfg")
 
     begin
-      MonitInterface.start(:controller, start_cmd, stop_cmd, nil, env,
-                           nil, nil, pidfile, nil)
+      MonitInterface.start_daemon(:controller, start_cmd, stop_cmd, pidfile)
     rescue
       Djinn.log_warn("Failed to set local AppController monit: retrying.")
       retry
@@ -4751,12 +4746,9 @@ HOSTS
     script = `which appscale-admin`.chomp
     nginx_port = 17441
     service_port = 17442
-    start_cmd = "/usr/bin/python2 #{script} -p #{service_port}"
+    start_cmd = "#{script} -p #{service_port}"
     start_cmd << ' --verbose' if @options['verbose'].downcase == 'true'
-    stop_cmd = "/usr/bin/python2 #{APPSCALE_HOME}/scripts/stop_service.py " +
-      "#{script} #{service_port}"
-    MonitInterface.start(:admin_server, start_cmd, stop_cmd, nil, nil,
-                         start_cmd, nil, nil, nil)
+    MonitInterface.start(:admin_server, start_cmd)
     Nginx.create_service_config('appscale-admin', my_node.private_ip,
                                 service_port, nginx_port)
   end
@@ -4770,10 +4762,7 @@ HOSTS
     Djinn.log_info("Starting up memcache")
     port = 11211
     start_cmd = "/usr/bin/memcached -m 64 -p #{port} -u root"
-    stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
-          "/usr/bin/memcached #{port}"
-    MonitInterface.start(:memcached, start_cmd, stop_cmd, nil, nil,
-                         start_cmd, nil, nil, nil)
+    MonitInterface.start(:memcached, start_cmd)
   end
 
   def stop_memcache()
@@ -5140,13 +5129,13 @@ HOSTS
           app = no_appservers[0]
           Djinn.log_info("Starting first AppServer for app: #{app}.")
           ret = add_appserver_process(app, @app_info_map[app]['nginx'],
-            @app_info_map[app]['nginx_https'], @app_info_map[app]['language'])
+            @app_info_map[app]['language'])
           Djinn.log_debug("add_appserver_process returned: #{ret}.")
         elsif !to_start[0].nil?
           app = to_start[0]
           Djinn.log_info("Starting AppServer for app: #{app}.")
           ret = add_appserver_process(app, @app_info_map[app]['nginx'],
-            @app_info_map[app]['nginx_https'], @app_info_map[app]['language'])
+            @app_info_map[app]['language'])
           Djinn.log_debug("add_appserver_process returned: #{ret}.")
         elsif !to_end[0].nil?
           Djinn.log_info("Terminate the following AppServer: #{to_end[0]}.")
@@ -5257,7 +5246,7 @@ HOSTS
     # Setup rsyslog to store application logs.
     app_log_config_file = get_rsyslog_conf(app)
     begin
-      existing_app_log_config = File.open(app_log_config_file, 'r').read()
+      existing_app_log_config = HelperFunctions.read_file(app_log_config_file)
     rescue Errno::ENOENT
       existing_app_log_config = ''
     end
@@ -5269,7 +5258,7 @@ HOSTS
       HelperFunctions.shell("service rsyslog restart")
     end
     begin
-      start_xmpp_for_app(app, nginx_port, @app_info_map[app]['language'])
+      start_xmpp_for_app(app, @app_info_map[app]['language'])
     rescue FailedNodeException
       Djinn.log_warn("Failed to start xmpp for application #{app}")
     end
@@ -5599,7 +5588,7 @@ HOSTS
       max_app_mem = Integer(@options['max_memory']) if max_app_mem.nil?
 
       app_info['appengine'].each { |location|
-        host, port = location.split(":")
+        host, _ = location.split(":")
         if appservers_count[host].nil?
           appservers_count[host] = 1
           max_memory[host] = max_app_mem
@@ -5821,12 +5810,10 @@ HOSTS
   #     be added for.
   #   nginx_port: A String or Fixnum that names the port that should be used to
   #     serve HTTP traffic for this app.
-  #   https_port: A String or Fixnum that names the port that should be used to
-  #     serve HTTPS traffic for this app.
   #   app_language: A String naming the language of the application.
   # Returns:
   #   A Boolean to indicate if the AppServer was successfully started.
-  def add_appserver_process(app, nginx_port, https_port, app_language)
+  def add_appserver_process(app, nginx_port, app_language)
     Djinn.log_info("Received request to add an AppServer for #{app}.")
 
     # Make sure we have the application setup properly.
@@ -6024,7 +6011,7 @@ HOSTS
     remove_node_from_local_and_zookeeper(node_to_remove.private_ip)
 
     to_remove = {}
-    @app_info_map.each { |app_id, info|
+    @app_info_map.each { |_, info|
       next if info['appengine'].nil?
 
       info['appengine'].each { |location|
@@ -6117,7 +6104,7 @@ HOSTS
   end
 
   # This function creates the xmpp account for 'app', as app@login_ip.
-  def start_xmpp_for_app(app, port, app_language)
+  def start_xmpp_for_app(app, app_language)
     watch_name = "xmpp-#{app}"
 
     # If we have it already running, nothing to do
@@ -6145,10 +6132,7 @@ HOSTS
 
     if Ejabberd.does_app_need_receive?(app, app_language)
       start_cmd = "#{PYTHON27} #{APPSCALE_HOME}/XMPPReceiver/xmpp_receiver.py #{app} #{login_ip} #{@@secret}"
-      stop_cmd = "#{PYTHON27} #{APPSCALE_HOME}/scripts/stop_service.py " +
-        "xmpp_receiver.py #{app}"
-      MonitInterface.start(watch_name, start_cmd, stop_cmd, nil, nil,
-                           start_cmd, nil, nil, nil)
+      MonitInterface.start(watch_name, start_cmd)
       Djinn.log_debug("App #{app} does need xmpp receive functionality")
     else
       Djinn.log_debug("App #{app} does not need xmpp receive functionality")
