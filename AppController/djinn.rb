@@ -1689,26 +1689,6 @@ class Djinn
     end
   end
 
-  # Tells the UserAppServer to reserve the given app_id for
-  # a particular user.
-  #
-  # Args:
-  #   username: A str representing the app administrator's e-mail address.
-  #   app_id: A str representing the application ID to reserve.
-  #   app_language: The runtime (Python 2.5/2.7, Java, or Go) that the app
-  #     runs over.
-  def reserve_app_id(username, app_id, app_language, secret)
-    return BAD_SECRET_MSG unless valid_secret?(secret)
-
-    begin
-      uac = UserAppClient.new(my_node.private_ip, @@secret)
-      return uac.commit_new_app_name(username, app_id, app_language)
-    rescue FailedNodeException
-      Djinn.log_warn("Failed to talk to the UserAppServer while reserving app id " +
-        "for the application #{app_id}.")
-    end
-  end
-
   # Removes an application and stops all AppServers hosting this application.
   #
   # Args:
@@ -2118,6 +2098,7 @@ class Djinn
           Djinn.log_info("--- This deployment has autoscale disabled.")
         end
         stats = JSON.parse(get_node_stats_json(secret))
+        Djinn.log_debug("Node stats: #{stats}")
         Djinn.log_info("--- Node at #{stats['public_ip']} has " +
           "#{stats['memory']['available']/MEGABYTE_DIVISOR}MB memory available " +
           "and knows about these apps #{stats['apps']}.")
@@ -4832,11 +4813,6 @@ HOSTS
     my_public = my_node.public_ip
     my_private = my_node.private_ip
 
-    # Reserve dashboard app ID.
-    result = reserve_app_id(APPSCALE_USER, AppDashboard::APP_NAME,
-      AppDashboard::APP_LANGUAGE, @@secret)
-    Djinn.log_debug("reserve_app_id for dashboard returned: #{result}.")
-
     source_archive = AppDashboard.prep(
       my_public, my_private, PERSISTENT_MOUNT_POINT, @@secret)
 
@@ -5851,7 +5827,17 @@ HOSTS
   #   remove_old: boolean to force a re-setup of the app from the tarball
   def setup_app_dir(app, remove_old=false)
     app_dir = "#{HelperFunctions.get_app_path(app)}/app"
-    app_path = "#{PERSISTENT_MOUNT_POINT}/apps/#{app}.tar.gz"
+
+    begin
+      version_details = ZKInterface.get_version_details(
+        app, DEFAULT_SERVICE, DEFAULT_VERSION)
+    rescue VersionNotFound
+      Djinn.log_debug(
+        "Skipping #{app} setup because version node does not exist")
+      return
+    end
+
+    app_path = version_details['deployment']['zip']['sourceUrl']
     error_msg = ""
 
     if remove_old
@@ -6054,7 +6040,9 @@ HOSTS
 
   # Returns true on success, false otherwise
   def copy_app_to_local(appname)
-    app_path = "#{PERSISTENT_MOUNT_POINT}/apps/#{appname}.tar.gz"
+    version_details = ZKInterface.get_version_details(
+      appname, DEFAULT_SERVICE, DEFAULT_VERSION)
+    app_path = version_details['deployment']['zip']['sourceUrl']
 
     if File.exists?(app_path)
       Djinn.log_debug("I already have a copy of app #{appname} - won't grab it remotely")
@@ -6241,7 +6229,6 @@ HOSTS
     node_stats["public_ip"] = my_node.public_ip
     node_stats["private_ip"] = my_node.private_ip
     node_stats["roles"] = my_node.jobs or ["none"]
-    Djinn.log_debug("Node stats: #{node_stats}")
 
     return JSON.dump(node_stats)
   end
