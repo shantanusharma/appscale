@@ -396,8 +396,8 @@ class Djinn
   SMALL_WAIT = 5
 
 
-  # How often we should attempt to increase the number of AppServers on a
-  # given node. It's measured as a multiplier of DUTY_CYCLE.
+  # How often we should attempt to scale up. It's measured as a multiplier
+  # of DUTY_CYCLE.
   SCALEUP_THRESHOLD = 5
 
 
@@ -406,21 +406,14 @@ class Djinn
   SCALEDOWN_THRESHOLD = 15
 
 
-  # When spinning new node up or down, we need to use a much longer time
-  # to dampen the scaling factor, to give time to the instance to fully
-  # boot, and to reap the benefit of an already running instance. This is
-  # a multiplication factor we use with the above thresholds.
+  # When scaling down instances we need to use a much longer time in order
+  # to reap the benefit of an already running instance.  This is a
+  # multiplication factor we use with the above threshold.
   SCALE_TIME_MULTIPLIER = 6
 
 
   # This is the generic retries to do.
   RETRIES = 5
-
-
-  # The minimum number of requests that have to sit in haproxy's wait queue for
-  # an App Engine application before we will scale up the number of AppServers
-  # that serve that application.
-  SCALEUP_QUEUE_SIZE_THRESHOLD = 5
 
 
   # A Float that determines how much CPU can be used before the autoscaler will
@@ -4440,6 +4433,12 @@ HOSTS
     # a default route.
     configure_uaserver()
 
+    # HAProxy must be running so that the UAServer can be accessed.
+    if HAProxy.valid_config?(HAProxy::SERVICES_MAIN_FILE) &&
+        !MonitInterface.is_running?(:service_haproxy)
+      HAProxy.services_start
+    end
+
     # Volume is mounted, let's finish the configuration of static files.
     if my_node.is_shadow? and not my_node.is_appengine?
       write_app_logrotate()
@@ -4449,6 +4448,12 @@ HOSTS
     if my_node.is_load_balancer?
       configure_db_haproxy
       Djinn.log_info("DB HAProxy configured")
+
+      # Make HAProxy instance stats accessible after a reboot.
+      if HAProxy.valid_config?(HAProxy::MAIN_CONFIG_FILE) &&
+          !MonitInterface.is_running?(:apps_haproxy)
+        HAProxy.apps_start
+      end
     end
 
     write_locations
@@ -5195,8 +5200,7 @@ HOSTS
       SCALE_LOCK.synchronize {
         Djinn.log_info("We need #{vms_to_spawn} more VMs.")
 
-        if Time.now.to_i - @last_scaling_time < (SCALEUP_THRESHOLD *
-              SCALE_TIME_MULTIPLIER * DUTY_CYCLE)
+        if Time.now.to_i - @last_scaling_time < (SCALEUP_THRESHOLD * DUTY_CYCLE)
           Djinn.log_info("Not scaling up right now, as we recently scaled " +
             "up or down.")
           return
@@ -5229,7 +5233,7 @@ HOSTS
     end
 
     # Also, don't scale down if we just scaled up or down.
-    if Time.now.to_i - @last_scaling_time < (SCALEUP_THRESHOLD *
+    if Time.now.to_i - @last_scaling_time < (SCALEDOWN_THRESHOLD *
         SCALE_TIME_MULTIPLIER * DUTY_CYCLE)
       Djinn.log_info("Not scaling down right now, as we recently scaled " +
         "up or down.")
@@ -5400,10 +5404,6 @@ HOSTS
     current_load = calculate_current_load(num_appengines, current_sessions,
                                           allow_concurrency)
     if current_load >= MAX_LOAD_THRESHOLD
-      if Time.now.to_i - @last_decision[app_name] < SCALEUP_THRESHOLD * DUTY_CYCLE
-        Djinn.log_debug("Not enough time has passed to scale up app #{app_name}")
-        return 0
-      end
       appservers_to_scale = calculate_appservers_needed(
         num_appengines, current_sessions, allow_concurrency)
       Djinn.log_debug("The deployment has reached its maximum load threshold for " +
@@ -5818,29 +5818,11 @@ HOSTS
     Djinn.log_info("Starting #{app_language} app #{app} on " +
       "#{@my_private_ip}:#{appengine_port}")
 
-    # The IP we use to reach this deployment: it will be used by XMPP, and
-    # dashboard (authentication) redirections.
-    login_ip = @options['login']
-
     app_manager = AppManagerClient.new(my_node.private_ip)
     begin
-      version_details = ZKInterface.get_version_details(
-        app, DEFAULT_SERVICE, DEFAULT_VERSION)
-    rescue VersionNotFound
-      Djinn.log_warn("#{app} not found when starting AppServer")
-      return false
-    end
-
-    max_app_mem = Integer(@options['max_memory'])
-    if version_details.key?('instanceClass')
-      instance_class = version_details['instanceClass'].to_sym
-      max_app_mem = INSTANCE_CLASSES.fetch(instance_class, max_app_mem)
-    end
-
-    begin
-      app_manager.start_app(app, appengine_port, login_ip,
-        app_language, HelperFunctions.get_app_env_vars(app), max_app_mem,
-        get_shadow.private_ip)
+      app_manager.start_app(
+        app, DEFAULT_SERVICE, DEFAULT_VERSION, appengine_port,
+        HelperFunctions.get_app_env_vars(app))
       @pending_appservers["#{app}:#{appengine_port}"] = Time.new
       Djinn.log_info("Done adding AppServer for #{app}.")
     rescue FailedNodeException => error
