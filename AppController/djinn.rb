@@ -163,18 +163,8 @@ class Djinn
 
 
   # An Array of Strings, each of which corresponding to the name of an App
-  # Engine app that should be loaded.
-  attr_accessor :app_names
-
-
-  # An Array of Strings, each of which corresponding to the name of an App
   # Engine app that has been loaded on this node.
   attr_accessor :versions_loaded
-
-
-  # An Array of Strings, each of which corresponding to the name of an App
-  # Engine app that should be restarted on this node.
-  attr_accessor :apps_to_restart
 
 
   # A boolean that is used to let remote callers know when this AppController
@@ -1727,25 +1717,6 @@ class Djinn
   def restart_versions(versions_to_restart)
     return if versions_to_restart.empty?
 
-    Djinn.log_info("Restarting versions: #{versions_to_restart}.")
-    # Self needs to update source code/cache.
-    if my_node.is_load_balancer?
-      versions_to_restart.each{ |version_key|
-        begin
-          HelperFunctions.parse_static_data(version_key, true)
-        rescue => except
-          except_trace = except.backtrace.join("\n")
-          Djinn.log_debug("restart_versions: parse_static_data exception" \
-            " from #{version_key}: #{except_trace}.")
-          # This specific exception may be a JSON parse error.
-          error_msg = "ERROR: Unable to parse app.yaml file for " +
-                      "#{version_key}. Exception of #{except.class} with " +
-                      "message #{except.message}"
-          place_error_app(version_key, error_msg)
-        end
-      }
-    end
-
     Djinn.log_info("Remove old AppServers for #{versions_to_restart}.")
     APPS_LOCK.synchronize {
       versions_to_restart.each{ |version_key|
@@ -1783,7 +1754,8 @@ class Djinn
     APPS_LOCK.synchronize {
       versions_to_restart = @versions_loaded & versions
     }
-    # Notify nodes, and remove any running AppServer of the application.
+
+    # Starts new AppServers (and stop the old ones) for the new versions.
     restart_versions(versions_to_restart)
 
     Djinn.log_info("Done updating #{versions}.")
@@ -1856,11 +1828,11 @@ class Djinn
     # the options for this deployment. It's either a save state from a
     # previous start, or it comes from the tools. If the tools communicate
     # the deployment's data, then we are the headnode.
-    unless restore_appcontroller_state()
-      erase_old_data()
-      wait_for_data()
+    unless restore_appcontroller_state
+      wait_for_data
+      erase_old_data
     end
-    parse_options()
+    parse_options
 
     # Load datastore helper.
     # TODO: this should be the class or module.
@@ -2404,12 +2376,19 @@ class Djinn
 
   # Cleans out temporary files that may have been written by a previous
   # AppScale deployment.
-  def erase_old_data()
+  def erase_old_data
     Djinn.log_run("rm -f ~/.appscale_cookies")
+
+    # Delete (possibly old) mapping of IP <-> HostKey.
+    @state_change_lock.synchronize {
+      @nodes.each { |node|
+        Djinn.log_run("ssh-keygen -R #{node.private_ip}")
+        Djinn.log_run("ssh-keygen -R #{node.public_ip}")
+      }
+    }
 
     Nginx.clear_sites_enabled()
     HAProxy.clear_sites_enabled()
-    Djinn.log_run("echo '' > /root/.ssh/known_hosts") # empty it out but leave the file there
     CronHelper.clear_app_crontabs()
   end
 
@@ -3879,6 +3858,7 @@ class Djinn
 
     # Ensure we don't have an old host key for this host.
     Djinn.log_run("ssh-keygen -R #{ip}")
+    Djinn.log_run("ssh-keygen -R #{dest_node.public_ip}")
 
     # Get the username to use for ssh (depends on environments).
     if ["ec2", "euca"].include?(@options['infrastructure'])
@@ -4127,7 +4107,7 @@ HOSTS
   # applications hosted in this deployment. Callers should invoke this
   # method whenever there is a change in the number of machines hosting
   # App Engine apps.
-  def regenerate_routing_config()
+  def regenerate_routing_config
     Djinn.log_debug("Regenerating nginx and haproxy config files for apps.")
     my_public = my_node.public_ip
     my_private = my_node.private_ip
@@ -4185,6 +4165,12 @@ HOSTS
         HAProxy.remove_version(version_key)
       else
         begin
+          # Make sure we have the latest revision.
+          revision_key = [version_key,
+            version_details['revision'].to_s].join(VERSION_PATH_SEPARATOR)
+          fetch_revision(revision_key)
+
+          # And grab the application static data.
           static_handlers = HelperFunctions.parse_static_data(
             version_key, false)
         rescue => except
@@ -4696,8 +4682,8 @@ HOSTS
   # or were terminated.
   def check_haproxy
     @versions_loaded.each{ |version_key|
-      _, failed = HAProxy.list_servers(version_key)
       if my_node.is_shadow?
+         _, failed = HAProxy.list_servers(version_key)
         failed.each{ |appserver|
           Djinn.log_warn(
             "Detected failed AppServer for #{version_key}: #{appserver}.")
@@ -5765,7 +5751,7 @@ HOSTS
 
     app_manager = AppManagerClient.new(my_node.private_ip)
     begin
-      app_manager.start_app(version_key, appserver_port)
+      app_manager.start_app(version_key, appserver_port, @options['login'])
       @pending_appservers["#{version_key}:#{appserver_port}"] = Time.new
       Djinn.log_info("Done adding AppServer for #{version_key}.")
     rescue FailedNodeException => error
