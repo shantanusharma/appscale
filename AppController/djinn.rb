@@ -4449,11 +4449,10 @@ HOSTS
         response = Net::HTTP.start(uri.hostname, uri.port) do |http|
           http.request(request)
         end
-        if response.code != '200'
-          HelperFunctions.log_and_crash(
-            "AdminServer failed to update dashboard cron: #{response.body}")
-        end
-        break
+        break if response.code == '200'
+        Djinn.log_warn(
+          "Error updating dashboard cron: #{response.body}. Trying again.")
+        sleep(SMALL_WAIT)
       rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT => error
         Djinn.log_warn(
           "Error updating dashboard cron: #{error.message}. Trying again.")
@@ -4473,8 +4472,10 @@ HOSTS
     my_public = my_node.public_ip
     my_private = my_node.private_ip
 
+    datastore_location = [get_load_balancer.private_ip,
+                          DatastoreServer::PROXY_PORT].join(':')
     source_archive = AppDashboard.prep(
-      my_public, my_private, PERSISTENT_MOUNT_POINT)
+      my_public, my_private, PERSISTENT_MOUNT_POINT, datastore_location)
 
     begin
       ZKInterface.get_version_details(
