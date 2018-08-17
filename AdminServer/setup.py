@@ -7,6 +7,8 @@ install_requires = [
   'kazoo',
   'psutil',
   'PyYaml',
+  'requests-unixsocket',
+  'six',
   'SOAPpy',
   'tabulate',
   'tornado',
